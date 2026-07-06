@@ -38,14 +38,14 @@ By the end of the sprint, our team aims to deliver:
 
 | Time | Activity | Notes / Updates | Completed |
 |---|---|---|---|
-| 15 min | Check Team Contract status and confirm all sign-offs |  | ✅ |
-| 20 min | Commit and push final `TEAM_CONTRACT.md` if not already done |  | ✅ |
+| 2 hours | Check Team Contract status and confirm all sign-offs |  | ✅ |
+| 60 min | Commit and push final `TEAM_CONTRACT.md` if not already done |  | ✅ |
 | 10 min | Submit Team Contract link to TalentLMS |  | ✅ |
-| 30 min | Review 4–6 project ideas from the team |  | ⬜ |
-| 30 min | Compare ideas using scope, data availability, AI capability, and evaluation |  | ⬜ |
-| 20 min | Select one final project idea |  | ⬜ |
-| 30 min | Define problem statement and target user |  | ⬜ |
-| 30 min | Define primary AI capability and AISPIRE components |  | ⬜ |
-| 20 min | Assign proposal-writing sections to teammates |  | ⬜ |
-| 60 min | Brainstorm project ideas — aim for 4–6 candidates |  | ⬜ |
-| 30 min | Choose one idea and sanity-check scope |  | ⬜ |
+| 3 hours | Review 4–6 project ideas from the team |  | ✅ |
+| 60 min | Compare ideas using scope, data availability, AI capability, and evaluation |  | ✅ |
+| 60 min | Select one final project idea |  | ✅ |
+| 60 min | Define problem statement and target user |  | ✅ |
+| 60 min | Define primary AI capability and AISPIRE components |  | ✅ |
+| 20 min | Assign proposal-writing sections to teammates |  | ✅ |
+| 60 min | Brainstorm project ideas — aim for 4–6 candidates |  | ✅ |
+| 30 min | Choose one idea and sanity-check scope |  | ✅ |
