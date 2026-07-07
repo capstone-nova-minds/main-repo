@@ -1,0 +1,13 @@
+services:
+  tender-app:
+    build: .
+    container_name: tender-intelligence-assistant
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./database:/app/database
+      - ./prompts:/app/prompts
+    restart: unless-stopped
