@@ -1,14 +1,17 @@
 """File handling: saving uploads, validating type/size, path helpers.
 
-All paths are relative to backend/data (mounted as a Docker volume so
-files persist and are shared with the host / other future consumers).
+Data lives in the repo-root data/ folder. In Docker, WORKDIR is /app and
+./data is mounted to /app/data (set via DATA_DIR env var in
+docker-compose.yml). Running locally (no Docker), DATA_DIR defaults to
+<repo_root>/data so backend and Streamlit share the same files.
 """
 
+import os
 import uuid
 from pathlib import Path
 from typing import Tuple
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent.parent / "data")))
 UPLOADS_DIR = DATA_DIR / "uploads"
 PAGES_DIR = DATA_DIR / "pages"
 PROCESSED_DIR = DATA_DIR / "processed"

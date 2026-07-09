@@ -1,14 +1,16 @@
 """Shows the processed page images for a document, if available on disk.
 
-The backend and frontend containers share the same ./data volume, so we
-can read page images directly instead of adding a dedicated API endpoint.
+The backend and frontend share the same data/ folder (a Docker volume in
+containers, or the repo-root data/ folder when run locally), so we can
+read page images directly instead of adding a dedicated API endpoint.
 """
 
+import os
 from pathlib import Path
 
 import streamlit as st
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent.parent / "data")))
 PAGES_DIR = DATA_DIR / "pages"
 
 
