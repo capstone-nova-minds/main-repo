@@ -15,3 +15,4 @@ class PersonRecord(BaseModel):
     confidence: float = 0.0
     needs_review: bool = True
     source: str = "rules"  # "rules", "ner", or "rules+ner"
+    extraction_method: Optional[str] = None

@@ -92,3 +92,26 @@ each `feature/*` branch owns one component, and all work merges into
 - Stanza's Arabic model must be downloaded (attempted at Docker build
   time); if unavailable, NER is skipped and the system falls back to
   rule-based extraction only.
+
+
+
+
+# one-time: install the missing backend deps into the existing venv
+
+.\.venv\Scripts\pip install fastapi opencv-python-headless easyocr pytesseract stanza
+
+
+
+# terminal 1 — backend
+
+cd backend
+
+..\.venv\Scripts\python -m uvicorn main:app --reload --port 8000
+
+
+
+# terminal 2 — frontend
+
+cd streamlit_app
+
+$env:API_BASE_URL python -m streamlit run app.py= "http://localhost:8000"   # default is http://backend:8000, only valid inside Docker

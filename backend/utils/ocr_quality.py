@@ -38,7 +38,7 @@ def calculate_ocr_quality(text: str, average_confidence: float) -> float:
     line_count = len([line for line in text.splitlines() if line.strip()])
     line_score = min(line_count / 10, 1.0)
 
-    confidence_score = max(0.0, min(average_confidence or 0.0, 1.0))
+    confidence_score = max(0.0, min(float(average_confidence or 0.0), 1.0))
 
     # Weighted blend: keyword presence and Arabic density matter most for
     # deciding whether OCR actually captured legal Arabic content.
@@ -52,4 +52,4 @@ def calculate_ocr_quality(text: str, average_confidence: float) -> float:
     if total_chars < MIN_USEFUL_TEXT_LENGTH:
         score *= 0.5
 
-    return round(max(0.0, min(score, 1.0)), 3)
+    return float(round(max(0.0, min(score, 1.0)), 3))

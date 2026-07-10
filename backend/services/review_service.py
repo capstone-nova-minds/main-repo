@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from services.file_service import EXTRACTED_DIR, REVIEWED_DIR, ensure_data_dirs
+from utils.json_utils import make_json_serializable
 
 
 def _extracted_path(document_id: str) -> Path:
@@ -21,8 +22,9 @@ def _reviewed_path(document_id: str) -> Path:
 
 def save_extracted_result(document_id: str, result: Dict[str, Any]) -> None:
     ensure_data_dirs()
+    safe_result = make_json_serializable(result)
     _extracted_path(document_id).write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(safe_result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
@@ -36,8 +38,9 @@ def load_extracted_result(document_id: str) -> Optional[Dict[str, Any]]:
 def save_reviewed_result(document_id: str, reviewed_data: Dict[str, Any]) -> None:
     ensure_data_dirs()
     reviewed_data["reviewed"] = True
+    safe_data = make_json_serializable(reviewed_data)
     _reviewed_path(document_id).write_text(
-        json.dumps(reviewed_data, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(safe_data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 

@@ -1,8 +1,7 @@
 """Arabic text normalization helpers.
 
 Used to clean raw OCR output before running extraction and NER, without
-altering the meaning of names or values (over-normalization can break
-name matching, so we keep changes conservative).
+altering the meaning of names or values.
 """
 
 import re
@@ -22,9 +21,9 @@ _ALEF_VARIANTS = str.maketrans({
     "آ": "ا",
 })
 
-# OCR garbage characters that are safe to strip (does not touch Arabic
-# letters, digits, or common punctuation used in dates/case numbers).
-_GARBAGE_PATTERN = re.compile(r"[|_~`\^\\<>{}\[\]]")
+# OCR garbage characters that are safe to strip.
+# Important: do NOT remove "/" because it is needed for dates and case numbers.
+_GARBAGE_PATTERN = re.compile(r"[|_~`\^<>{}\[\]]")
 
 _MULTI_SPACE_PATTERN = re.compile(r"[ \t]+")
 
@@ -37,10 +36,32 @@ def normalize_arabic_digits(text: str) -> str:
 
 
 def normalize_arabic_letters(text: str) -> str:
-    """Normalize alef variants (أ, إ, آ -> ا) to help keyword/name matching."""
+    """Normalize alef variants: أ, إ, آ -> ا."""
     if not text:
         return text
     return text.translate(_ALEF_VARIANTS)
+
+
+def normalize_separators(text: str) -> str:
+    """Normalize separators used in dates and case numbers."""
+    if not text:
+        return text
+
+    replacements = {
+        "\\": "/",   # OCR may read slash as backslash
+        "／": "/",
+        "⁄": "/",
+        "–": "-",
+        "—": "-",
+        "−": "-",
+        "：": ":",
+        "؛": ":",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return text
 
 
 def remove_garbage_symbols(text: str) -> str:
@@ -54,23 +75,47 @@ def collapse_whitespace(text: str) -> str:
     """Collapse repeated spaces/tabs and trim each line."""
     if not text:
         return text
-    lines = [_MULTI_SPACE_PATTERN.sub(" ", line).strip() for line in text.splitlines()]
+
+    lines = [
+        _MULTI_SPACE_PATTERN.sub(" ", line).strip()
+        for line in text.splitlines()
+    ]
+
     return "\n".join(line for line in lines if line != "")
 
 
-def normalize_text(raw_text: str) -> dict:
-    """Return both the original OCR text and a cleaned version.
+def normalize_arabic_text(text: str) -> str:
+    """
+    Return cleaned Arabic text as a plain string.
+    This is the main function used by extraction services.
+    """
+    if text is None:
+        text = ""
 
-    Cleaning order matters: digits/letters first, then garbage removal,
-    then whitespace collapsing last so stripped symbols don't leave gaps.
+    cleaned = normalize_arabic_digits(text)
+    cleaned = normalize_arabic_letters(cleaned)
+    cleaned = normalize_separators(cleaned)
+    cleaned = remove_garbage_symbols(cleaned)
+    cleaned = collapse_whitespace(cleaned)
+
+    return cleaned.strip()
+
+
+def split_lines(text: str) -> list[str]:
+    """Normalize text and split it into non-empty lines."""
+    cleaned = normalize_arabic_text(text)
+    return [line.strip() for line in cleaned.splitlines() if line.strip()]
+
+
+def normalize_text(raw_text: str) -> dict:
+    """
+    Return both original OCR text and cleaned text.
+    Keep this function because process.py may already depend on it.
     """
     if raw_text is None:
         raw_text = ""
 
-    cleaned = normalize_arabic_digits(raw_text)
-    cleaned = normalize_arabic_letters(cleaned)
-    cleaned = remove_garbage_symbols(cleaned)
-    cleaned = collapse_whitespace(cleaned)
+    cleaned = normalize_arabic_text(raw_text)
 
     return {
         "original_text": raw_text,

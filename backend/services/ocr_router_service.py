@@ -14,7 +14,7 @@ from services.ocr_engines.tesseract_engine import TesseractEngine
 from services.ocr_engines.paddleocr_engine_stub import PaddleOCREngineStub
 from utils.ocr_quality import calculate_ocr_quality
 
-QUALITY_THRESHOLD = float(os.getenv("OCR_QUALITY_THRESHOLD", "0.65"))
+QUALITY_THRESHOLD = float(os.getenv("OCR_QUALITY_THRESHOLD", "0.75"))
 
 # Engines are created once and reused (EasyOCR/Tesseract availability
 # checks and model loads are expensive).
@@ -39,7 +39,7 @@ def _run_engine_attempt(engine, image_path: str) -> Dict[str, Any]:
 
         result = engine.extract_text(image_path)
         text = result.get("text", "") or ""
-        confidence = result.get("average_confidence", 0.0) or 0.0
+        confidence = float(result.get("average_confidence", 0.0) or 0.0)
         quality = calculate_ocr_quality(text, confidence)
 
         return {
@@ -107,7 +107,7 @@ def run_ocr_on_page(page_number: int, image_path: Path) -> Dict[str, Any]:
         "text": best_attempt.get("text", ""),
         "average_confidence": best_attempt["average_confidence"],
         "quality_score": best_attempt["quality_score"],
-        "needs_review": page_status != "success" or best_attempt["quality_score"] < QUALITY_THRESHOLD,
+        "needs_review": bool(page_status != "success" or best_attempt["quality_score"] < QUALITY_THRESHOLD),
         "engine_attempts": attempt_summaries,
     }
 

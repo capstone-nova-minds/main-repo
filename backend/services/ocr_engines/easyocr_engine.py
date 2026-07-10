@@ -54,7 +54,10 @@ class EasyOCREngine(BaseOCREngine):
             }
 
         lines = [text for (_bbox, text, _conf) in results]
-        confidences = [conf for (_bbox, _text, conf) in results]
+        # EasyOCR returns numpy.float32/64 confidences -- cast to plain
+        # Python float so this never leaks a non-JSON-serializable type
+        # downstream (quality scoring, needs_review comparisons, etc.).
+        confidences = [float(conf) for (_bbox, _text, conf) in results]
 
         return {
             "text": "\n".join(lines),

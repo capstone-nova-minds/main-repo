@@ -1,6 +1,6 @@
 """Pydantic models for OCR/NER summaries and the final extraction result."""
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -25,6 +25,10 @@ class NERSummary(BaseModel):
     organization_entities: int = 0
     needs_review: bool = False
     error: Optional[str] = None
+    # NER PERSON entities with no nearby National ID and no match to a
+    # rule-based record: not trusted enough for final persons, kept here
+    # for visibility/debugging only. See entity_merge_service.
+    suggested_entities: List[Dict[str, Any]] = []
 
 
 class ExtractionResult(BaseModel):

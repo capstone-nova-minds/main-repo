@@ -25,6 +25,17 @@ if "extraction_result" not in st.session_state:
 
 result = st.session_state["extraction_result"]
 
+ocr_summary = result.get("ocr_summary", {})
+if ocr_summary.get("quality_score", 1.0) < 0.75:
+    st.warning("جودة قراءة OCR منخفضة (أقل من 0.75) -- يرجى مراجعة جميع الحقول بعناية.")
+
+document_date = (result.get("document", {}).get("document_date") or {}).get("value")
+if not document_date:
+    st.warning("لم يتم استخراج التاريخ -- يرجى إدخاله يدويًا إذا كان متوفرًا في المستند.")
+
+if not result.get("persons"):
+    st.warning("لم يتم استخراج أي أشخاص -- يرجى إضافتهم يدويًا إذا لزم الأمر.")
+
 col_doc, col_view = st.columns([2, 1])
 
 with col_doc:

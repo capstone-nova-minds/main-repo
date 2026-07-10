@@ -1,8 +1,15 @@
 """Basic OpenCV image preprocessing to improve OCR accuracy.
 
-Kept intentionally simple: grayscale -> resize (if small) -> denoise ->
-adaptive threshold. Each step is wrapped so a single failure doesn't
-crash the whole pipeline (falls back to the least-processed image).
+Kept intentionally simple: grayscale -> upscale (if small) -> light
+denoise -> contrast enhancement. Each step is wrapped so a single
+failure doesn't crash the whole pipeline (falls back to the
+least-processed image).
+
+Note: this intentionally does NOT hard-binarize (cv2.adaptiveThreshold)
+the image. Small header text (case number, date) is often only a few
+pixels tall, and hard thresholding tends to erase or fuse those thin
+strokes -- which is what was hurting OCR quality on document headers.
+CLAHE contrast enhancement improves legibility without destroying it.
 """
 
 from pathlib import Path
@@ -13,7 +20,10 @@ import numpy as np
 
 from services.file_service import PROCESSED_DIR
 
-MIN_DIMENSION = 1000  # upscale small scans so OCR has more pixels to work with
+# If the image is narrower than this, upscale 2x so small header text
+# (case number, date) has enough pixels for OCR to resolve.
+WIDTH_UPSCALE_THRESHOLD = 1800
+UPSCALE_FACTOR = 2
 
 
 def _processed_dir(document_id: str) -> Path:
@@ -22,30 +32,34 @@ def _processed_dir(document_id: str) -> Path:
     return folder
 
 
-def _resize_if_small(image: np.ndarray) -> np.ndarray:
-    height, width = image.shape[:2]
-    smallest_side = min(height, width)
-    if smallest_side >= MIN_DIMENSION:
+def _upscale_if_small(image: np.ndarray) -> np.ndarray:
+    _height, width = image.shape[:2]
+    if width >= WIDTH_UPSCALE_THRESHOLD:
         return image
-    scale = MIN_DIMENSION / smallest_side
-    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(
+        image, None, fx=UPSCALE_FACTOR, fy=UPSCALE_FACTOR, interpolation=cv2.INTER_CUBIC
+    )
 
 
 def preprocess_image(image_path: Path) -> np.ndarray:
-    """Run the grayscale/resize/denoise/threshold pipeline on one image."""
+    """Run the grayscale/upscale/denoise/contrast pipeline on one image."""
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Could not read image: {image_path}")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = _resize_if_small(gray)
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    thresholded = cv2.adaptiveThreshold(
-        denoised, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
-        blockSize=31, C=10,
-    )
-    return thresholded
+    gray = _upscale_if_small(gray)
+
+    # Light denoise only -- a small h keeps thin header strokes intact.
+    denoised = cv2.fastNlMeansDenoising(gray, h=7)
+
+    # CLAHE (contrast-limited adaptive histogram equalization) boosts
+    # local contrast so faint/small text becomes easier to read, without
+    # collapsing it to hard black/white like adaptiveThreshold does.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+
+    return enhanced
 
 
 def preprocess_pages(document_id: str, page_paths: List[Path]) -> List[Path]:

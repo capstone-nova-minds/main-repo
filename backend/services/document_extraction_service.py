@@ -1,11 +1,16 @@
-"""Rule-based extraction of document-level fields (court, case number,
-document number, date) using deterministic keyword + regex matching.
+"""Rule-based extraction of document-level fields.
 
-No LLM, no ML model -- every decision here is explainable.
+Extracts:
+- court_name
+- case_number
+- document_number
+- document_date
+
+No LLM, no cloud AI. Everything is deterministic and explainable.
 """
 
 import re
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from schemas.document_schema import DocumentInfo, ExtractedField
 from utils.confidence import (
@@ -19,96 +24,479 @@ from utils.regex_patterns import (
     CASE_NUMBER_KEYWORDS,
     DOCUMENT_NUMBER_KEYWORDS,
     DOCUMENT_DATE_KEYWORDS,
-    DATE_PATTERN,
+    DATE_PATTERN_YMD,
+    DATE_PATTERN_DMY,
+    DATE_PATTERN_COMPACT,
 )
 
-# Matches "<keyword> ... : <value>" or "<keyword> ... <value>" on one line.
-_VALUE_AFTER_COLON = re.compile(r"[:：]\s*(.+)$")
-_TRAILING_NUMBER_OR_TEXT = re.compile(r"([\w/\-؀-ۿ]+)\s*$")
 
+# ---------------------------------------------------------------------------
+# Case / document number patterns
+# ---------------------------------------------------------------------------
+
+_CASE_WITH_SEPARATOR_PATTERN = re.compile(
+    r"(?<!\d)((?:20\d{2}|19\d{2})\s*[\/\-]\s*\d{1,6})(?!\d)"
+)
+
+_COMPACT_CASE_PATTERN = re.compile(
+    r"(?<!\d)((?:20\d{2}|19\d{2})(?:\d{1,4}))(?!\d)"
+)
+
+_VALUE_AFTER_COLON = re.compile(r"[:：]\s*(.+)$")
+
+
+# ---------------------------------------------------------------------------
+# Strong local date fallback patterns
+# ---------------------------------------------------------------------------
+# These are intentionally defined here so date extraction does not fail
+# if regex_patterns.py is missing one OCR case.
+
+_LOCAL_DATE_YMD = re.compile(
+    r"(?<!\d)((?:20\d{2}|19\d{2})[\/\-.](0?[1-9]|1[0-2])[\/\-.](0?[1-9]|[12]\d|3[01]))(?!\d)"
+)
+
+_LOCAL_DATE_DMY = re.compile(
+    r"(?<!\d)((0?[1-9]|[12]\d|3[01])[\/\-.](0?[1-9]|1[0-2])[\/\-.]((?:20\d{2}|19\d{2})))(?!\d)"
+)
+
+_LOCAL_DATE_COMPACT = re.compile(
+    r"(?<!\d)((?:20\d{2}|19\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01]))(?!\d)"
+)
+
+_LOCAL_DATE_YEAR_SLASH_MMDD = re.compile(
+    r"(?<!\d)((?:20\d{2}|19\d{2})[\/\-.]((?:0?[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])))(?!\d)"
+)
+
+OCR_DATE_KEYWORD_VARIANTS = [
+    "التاريخ",
+    "تاريخ",
+    "بتاريخ",
+    "الموافق",
+    # Common OCR mistakes:
+    "التاربخ",
+    "التاربح",
+    "التاريح",
+    "تاربخ",
+]
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
 def _empty_field() -> ExtractedField:
-    return ExtractedField(value=None, confidence=MISSING_CONFIDENCE, needs_review=True)
+    return ExtractedField(
+        value=None,
+        confidence=MISSING_CONFIDENCE,
+        needs_review=True,
+    )
+
+
+def _field(value: Optional[str], confidence: float, review: Optional[bool] = None) -> ExtractedField:
+    if not value:
+        
+        return _empty_field()
+
+    value = str(value).strip()
+
+    if review is None:
+        review = needs_review(confidence)
+
+    return ExtractedField(
+        value=value,
+        confidence=float(confidence),
+        needs_review=bool(review),
+    )
+
+
+def _clean_text_value(value: str) -> Optional[str]:
+    if not value:
+        return None
+
+    value = str(value).strip()
+    value = re.sub(r"\s+", " ", value)
+    value = value.lstrip(":：-–— ").strip()
+
+    return value if value else None
 
 
 def _find_value_on_line(line: str, keyword: str) -> Optional[str]:
-    """Given a line containing `keyword`, try to pull the value after it."""
+    """Given a line containing keyword, pull value after keyword."""
     idx = line.find(keyword)
+
     if idx == -1:
         return None
+
     remainder = line[idx + len(keyword):].strip()
 
     colon_match = _VALUE_AFTER_COLON.search(remainder)
+
     if colon_match:
-        value = colon_match.group(1).strip()
-        return value if value else None
+        return _clean_text_value(colon_match.group(1))
 
-    remainder = remainder.lstrip(":：-  ").strip()
-    return remainder if remainder else None
+    return _clean_text_value(remainder)
 
+
+def _build_search_area(lines: List[str], index: int) -> str:
+    """
+    Search previous + current + next line.
+
+    Needed because OCR may read:
+    2026/02/04
+    التاريخ
+
+    instead of:
+    التاريخ: 2026/02/04
+    """
+    parts = []
+
+    if index - 1 >= 0:
+        parts.append(lines[index - 1].strip())
+
+    parts.append(lines[index].strip())
+
+    if index + 1 < len(lines):
+        parts.append(lines[index + 1].strip())
+
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Case / document number extraction
+# ---------------------------------------------------------------------------
+
+def _normalize_case_number(raw_value: str) -> Optional[str]:
+    """
+    Normalize case/document number.
+
+    Examples:
+    - 2026/41 -> 2026/41
+    - 2026 - 41 -> 2026/41
+    - 202641 بداية -> 2026/41
+    """
+    if not raw_value:
+        return None
+
+    value = str(raw_value).strip()
+    value = re.sub(r"\s+", " ", value)
+
+    sep_match = _CASE_WITH_SEPARATOR_PATTERN.search(value)
+
+    if sep_match:
+        number = sep_match.group(1)
+        number = re.sub(r"\s+", "", number)
+        number = number.replace("-", "/")
+        return number
+
+    compact_match = _COMPACT_CASE_PATTERN.search(value)
+
+    if compact_match:
+        compact = compact_match.group(1)
+
+        # Avoid treating full dates like 20260204 as case numbers.
+        if len(compact) == 8:
+            return None
+
+        year = compact[:4]
+        rest = compact[4:]
+
+        if rest:
+            return f"{year}/{rest}"
+
+    return None
+
+
+def _extract_case_like_value(search_area: str) -> Optional[str]:
+    return _normalize_case_number(search_area)
+
+
+# ---------------------------------------------------------------------------
+# Date extraction
+# ---------------------------------------------------------------------------
+
+def _normalize_date_string(raw_date: str) -> Optional[str]:
+    """Normalize a raw date string into YYYY/MM/DD."""
+    if not raw_date:
+        return None
+
+    value = str(raw_date).strip()
+    value = value.replace("-", "/").replace(".", "/")
+    value = re.sub(r"\s+", "", value)
+
+    # 20260204 -> 2026/02/04
+    if re.fullmatch(r"(?:20\d{2}|19\d{2})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])", value):
+        return f"{value[0:4]}/{value[4:6]}/{value[6:8]}"
+
+    # 2026/0204 -> 2026/02/04
+    match = re.fullmatch(
+        r"((?:20\d{2}|19\d{2}))\/((?:0?[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))",
+        value,
+    )
+
+    if match:
+        year = match.group(1)
+        rest = match.group(2).zfill(4)
+        return f"{year}/{rest[0:2]}/{rest[2:4]}"
+
+    # 2026/02/04
+    parts = value.split("/")
+
+    if len(parts) == 3:
+        first, second, third = parts
+
+        # YYYY/MM/DD
+        if len(first) == 4:
+            return f"{first}/{second.zfill(2)}/{third.zfill(2)}"
+
+        # DD/MM/YYYY
+        if len(third) == 4:
+            return f"{third}/{second.zfill(2)}/{first.zfill(2)}"
+
+    return None
+
+
+def _normalize_date_value(text: str) -> Optional[str]:
+    """
+    Find a date anywhere in text and normalize it to YYYY/MM/DD.
+
+    Supports:
+    - 2026/02/04
+    - 2026-02-04
+    - 04/02/2026
+    - 20260204
+    - 2026/0204
+    """
+    if not text:
+        return None
+
+    # First use existing project patterns.
+    match = DATE_PATTERN_YMD.search(text)
+
+    if match:
+        year, month, day = match.group(1), match.group(2), match.group(3)
+        return f"{year}/{int(month):02d}/{int(day):02d}"
+
+    match = DATE_PATTERN_DMY.search(text)
+
+    if match:
+        day, month, year = match.group(1), match.group(2), match.group(3)
+        return f"{year}/{int(month):02d}/{int(day):02d}"
+
+    match = DATE_PATTERN_COMPACT.search(text)
+
+    if match:
+        year, month, day = match.group(1), match.group(2), match.group(3)
+        return f"{year}/{int(month):02d}/{int(day):02d}"
+
+    # Then use stronger local fallbacks.
+    match = _LOCAL_DATE_YMD.search(text)
+
+    if match:
+        return _normalize_date_string(match.group(1))
+
+    match = _LOCAL_DATE_DMY.search(text)
+
+    if match:
+        return _normalize_date_string(match.group(1))
+
+    match = _LOCAL_DATE_COMPACT.search(text)
+
+    if match:
+        return _normalize_date_string(match.group(1))
+
+    match = _LOCAL_DATE_YEAR_SLASH_MMDD.search(text)
+
+    if match:
+        return _normalize_date_string(match.group(1))
+
+    return None
+
+
+def _extract_date_value(search_area: str) -> Optional[str]:
+    return _normalize_date_value(search_area)
+
+
+def _extract_first_date_anywhere(text: Optional[str]) -> Optional[str]:
+    """
+    Strong fallback:
+    If header OCR contains a date, extract it even if the keyword is missing
+    or OCR read "التاريخ" incorrectly as "التاربخ".
+    """
+    if not text:
+        return None
+
+    return _normalize_date_value(text)
+
+
+# ---------------------------------------------------------------------------
+# Field extraction
+# ---------------------------------------------------------------------------
 
 def _extract_court_name(lines: List[str]) -> ExtractedField:
+    """
+    Court name is usually in document header.
+    Example: محكمة اربد الابتدائية
+    """
+    for line in lines[:15]:
+        clean_line = line.strip()
+
+        if "محكمة" in clean_line:
+            return _field(clean_line, EXACT_MATCH_CONFIDENCE, False)
+
     for line in lines:
+        clean_line = line.strip()
+
         for keyword in COURT_NAME_KEYWORDS:
-            if keyword in line:
-                # Court name is usually the whole line itself.
-                return ExtractedField(
-                    value=line.strip(),
-                    confidence=EXACT_MATCH_CONFIDENCE,
-                    needs_review=needs_review(EXACT_MATCH_CONFIDENCE),
-                )
+            if keyword in clean_line:
+                return _field(clean_line, NEARBY_MATCH_CONFIDENCE, False)
+
     return _empty_field()
 
 
-def _extract_keyword_value(lines: List[str], keywords: List[str]) -> ExtractedField:
-    for line in lines:
-        for keyword in keywords:
+def _extract_case_number(lines: List[str]) -> ExtractedField:
+    """
+    Extract case number from phrases like:
+    - بالدعوى رقم 2026/41
+    - دعوى رقم 202641 بداية
+    """
+    for i, line in enumerate(lines):
+        for keyword in CASE_NUMBER_KEYWORDS:
             if keyword in line:
-                value = _find_value_on_line(line, keyword)
+                value_after_keyword = _find_value_on_line(line, keyword)
+                value = _extract_case_like_value(value_after_keyword or line)
+
+                if not value and i + 1 < len(lines):
+                    value = _extract_case_like_value(lines[i + 1])
+
                 if value:
-                    return ExtractedField(
-                        value=value,
-                        confidence=EXACT_MATCH_CONFIDENCE,
-                        needs_review=needs_review(EXACT_MATCH_CONFIDENCE),
-                    )
-                return ExtractedField(
-                    value=None,
-                    confidence=NEARBY_MATCH_CONFIDENCE,
-                    needs_review=True,
-                )
+                    return _field(value, EXACT_MATCH_CONFIDENCE, False)
+
+                return _field(None, NEARBY_MATCH_CONFIDENCE, True)
+
+    for line in lines:
+        value = _extract_case_like_value(line)
+
+        if value:
+            return _field(value, NEARBY_MATCH_CONFIDENCE, True)
+
+    return _empty_field()
+
+
+def _extract_document_number(lines: List[str]) -> ExtractedField:
+    header_lines = lines[:20]
+
+    for i, line in enumerate(header_lines):
+        for keyword in DOCUMENT_NUMBER_KEYWORDS:
+            if keyword in line:
+                value_after_keyword = _find_value_on_line(line, keyword)
+                value = _extract_case_like_value(value_after_keyword or line)
+
+                if not value and i + 1 < len(header_lines):
+                    value = _extract_case_like_value(header_lines[i + 1])
+
+                if value:
+                    return _field(value, EXACT_MATCH_CONFIDENCE, False)
+
+                return _field(None, NEARBY_MATCH_CONFIDENCE, True)
+
+    for line in header_lines[:10]:
+        value = _extract_case_like_value(line)
+
+        if value:
+            return _field(value, EXACT_MATCH_CONFIDENCE, False)
+
     return _empty_field()
 
 
 def _extract_document_date(lines: List[str]) -> ExtractedField:
-    for line in lines:
-        for keyword in DOCUMENT_DATE_KEYWORDS:
+    """
+    Extract date from:
+    التاريخ: 2026/02/04
+
+    Also supports OCR cases:
+    2026/02/04
+    التاربخ
+    """
+    # 1. Keyword-based search with previous/current/next line.
+    for i, line in enumerate(lines):
+        all_date_keywords = list(DOCUMENT_DATE_KEYWORDS) + OCR_DATE_KEYWORD_VARIANTS
+
+        for keyword in all_date_keywords:
             if keyword in line:
-                date_match = DATE_PATTERN.search(line)
-                if date_match:
-                    return ExtractedField(
-                        value=date_match.group(0),
-                        confidence=EXACT_MATCH_CONFIDENCE,
-                        needs_review=needs_review(EXACT_MATCH_CONFIDENCE),
-                    )
-    # Fall back: any recognizable date pattern anywhere in the text.
-    for line in lines:
-        date_match = DATE_PATTERN.search(line)
-        if date_match:
-            return ExtractedField(
-                value=date_match.group(0),
-                confidence=NEARBY_MATCH_CONFIDENCE,
-                needs_review=True,
-            )
+                search_area = _build_search_area(lines, i)
+                value = _extract_date_value(search_area)
+
+                if value:
+                    return _field(value, EXACT_MATCH_CONFIDENCE, False)
+
+                return _field(None, NEARBY_MATCH_CONFIDENCE, True)
+
+    # 2. Strong fallback: any recognizable date anywhere.
+    full_text = "\n".join(lines)
+    value = _extract_first_date_anywhere(full_text)
+
+    if value:
+        return _field(value, 0.85, False)
+
     return _empty_field()
 
 
-def extract_document_fields(cleaned_text: str) -> DocumentInfo:
-    """Run all document-level extraction rules over normalized OCR text."""
-    lines = [line for line in cleaned_text.splitlines() if line.strip()]
+# ---------------------------------------------------------------------------
+# Public function
+# ---------------------------------------------------------------------------
+
+def extract_document_fields(cleaned_text: str, header_text: Optional[str] = None) -> DocumentInfo:
+    """Run document-level extraction over normalized OCR text.
+
+    header_text is searched first for document_date because the header crop is
+    the most reliable place for:
+    - 2026/41
+    - 2026/02/04
+    - التاريخ / التاربخ
+    """
+    if cleaned_text is None:
+        cleaned_text = ""
+
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+
+    court_name = _extract_court_name(lines)
+    case_number = _extract_case_number(lines)
+    document_number = _extract_document_number(lines)
+
+    # Date extraction:
+    # 1. First extract any date from header_text directly.
+    #    This fixes OCR output like:
+    #    2026/02/04
+    #    :
+    #    التاربخ
+    document_date = _empty_field()
+
+    if header_text:
+        direct_header_date = _extract_first_date_anywhere(header_text)
+
+        if direct_header_date:
+            document_date = _field(direct_header_date, 0.90, False)
+        else:
+            header_lines = [line.strip() for line in header_text.splitlines() if line.strip()]
+            document_date = _extract_document_date(header_lines)
+
+    # 2. If header did not work, search full OCR text.
+    if document_date.value is None:
+        direct_text_date = _extract_first_date_anywhere(cleaned_text)
+
+        if direct_text_date:
+            document_date = _field(direct_text_date, 0.85, False)
+        else:
+            document_date = _extract_document_date(lines)
+
+    # Fallback: many court letters reuse the case/reference number as the
+    # header "الرقم" field, but OCR often misses that small header line.
+    if document_number.value is None and case_number.value is not None:
+        document_number = _field(case_number.value, NEARBY_MATCH_CONFIDENCE, True)
 
     return DocumentInfo(
-        court_name=_extract_court_name(lines),
-        case_number=_extract_keyword_value(lines, CASE_NUMBER_KEYWORDS),
-        document_number=_extract_keyword_value(lines, DOCUMENT_NUMBER_KEYWORDS),
-        document_date=_extract_document_date(lines),
+        court_name=court_name,
+        case_number=case_number,
+        document_number=document_number,
+        document_date=document_date,
     )
