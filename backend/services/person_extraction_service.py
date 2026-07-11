@@ -1,12 +1,14 @@
 """Rule-based extraction of person/company candidate records.
 
 This service extracts persons and companies from normalized OCR text using
-four methods, from most to least precise:
+five methods, from most to least precise:
 
+0. Structured target-list extraction.
 1. Direct legal-phrase + name + National ID regex.
 2. Legal-keyword candidate lines.
 3. Line-context extraction around every valid National ID.
 4. Emergency wide-context fallback around National ID.
+5. OCR orphan first-name recovery.
 
 No LLM and no cloud AI are used.
 """
@@ -37,6 +39,48 @@ _ARABIC_WORD_PATTERN = re.compile(r"[\u0600-\u06FF]{2,}")
 
 MIN_NAME_WORDS = 3
 
+
+_STRUCTURED_LABEL_NOISE = {
+    "نوع",
+    "الشخص",
+    "فرد",
+    "شركة",
+    "الرقم",
+    "الوطني",
+    "رقم",
+    "وطني",
+    "التسجيل",
+    "الأشخاص",
+    "الاشخاص",
+    "الجهات",
+    "المطلوبة",
+    "المطلوبه",
+    "المعلومات",
+    "المتوفرة",
+    "الواردة",
+    "أدناه",
+    "ادناه",
+    "حول",
+    "الأسماء",
+    "الاسماء",
+    "قرار",
+    "المحكمة",
+    "يرجى",
+    "اتخاذ",
+    "الاجراءات",
+    "الإجراءات",
+    "حسب",
+    "الأصول",
+    "الاصول",
+    "استنادا",
+    "استنادأ",
+    "لديكم",
+    "وتزويدنا",
+    "تاريخ",
+    "امر",
+    "أمر",
+    "اللازمة",
+}
 
 INVALID_NAME_WORDS = {
     "الحجز",
@@ -71,6 +115,27 @@ INVALID_NAME_WORDS = {
     "السيد",
     "مدير",
     "المحترم",
+    "نوع",
+    "الشخص",
+    "فرد",
+    "الرقم",
+    "الوطني",
+    "إلى",
+    "الى",
+    "السادة",
+    "تحية",
+    "طيبة",
+    "طبية",
+    "وبعد",
+    "المعلومات",
+    "المتوفرة",
+    "الأشخاص",
+    "الاشخاص",
+    "الجهات",
+    "المطلوبة",
+    "الواردة",
+    "أدناه",
+    "ادناه",
 }
 
 
@@ -81,6 +146,7 @@ _NAME_NOISE_WORDS = {
     "بداية",
     "حقوق",
     "اربد",
+    "إربد",
     "لقد",
     "تقرر",
     "بالدعوى",
@@ -180,28 +246,40 @@ _DIRECT_PHRASE_PATTERNS = [
 ]
 
 
-# Common OCR mistakes in Arabic names.
 _OCR_NAME_FIXES = {
     "بوسف": "يوسف",
+    "المصرى": "المصري",
+    "احمد": "أحمد",
 }
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Generic helpers
 # ---------------------------------------------------------------------------
 
 def _record_kwargs(**kwargs):
     """Only pass fields that exist in PersonRecord."""
     try:
-        fields = set(PersonRecord.model_fields.keys())  # Pydantic v2
+        fields = set(PersonRecord.model_fields.keys())
     except AttributeError:
-        fields = set(PersonRecord.__fields__.keys())  # Pydantic v1
+        fields = set(PersonRecord.__fields__.keys())
 
     return {key: value for key, value in kwargs.items() if key in fields}
 
 
 def _make_person_record(**kwargs) -> PersonRecord:
     return PersonRecord(**_record_kwargs(**kwargs))
+
+
+def _copy_record_with_updates(record: PersonRecord, **updates) -> PersonRecord:
+    """Return updated PersonRecord without mutating the original."""
+    if hasattr(record, "model_dump"):
+        data = record.model_dump()
+    else:
+        data = record.dict()
+
+    data.update(updates)
+    return PersonRecord(**data)
 
 
 def _normalize_spaces(text: str) -> str:
@@ -240,6 +318,8 @@ def _cut_before_stop_words(text: str) -> str:
 
 
 def is_company_line(line: str) -> bool:
+    if not line:
+        return False
     return any(keyword in line for keyword in COMPANY_KEYWORDS)
 
 
@@ -254,11 +334,14 @@ def is_valid_person_name(
     has_national_id: bool = False,
     direct_pattern_match: bool = False,
 ) -> bool:
-    """Reject false positives like land/property descriptions or legal terms."""
+    """Reject false positives like headers/legal words."""
     if not name:
         return False
 
     words = name.split()
+
+    if any(word in _STRUCTURED_LABEL_NOISE for word in words):
+        return False
 
     if any(word in INVALID_NAME_WORDS for word in words):
         return False
@@ -293,21 +376,400 @@ def _matched_keyword(line: str) -> Optional[str]:
     return None
 
 
-def _extract_registration_number(line: str) -> Optional[str]:
-    patterns = [
-        r"رقم تسجيل\s*[:：]?\s*(\d{3,15})",
-        r"سجل تجاري\s*[:：]?\s*(\d{3,15})",
-        r"رقم الشركة\s*[:：]?\s*(\d{3,15})",
-    ]
+def _normalize_registration_number(value: str) -> Optional[str]:
+    """Normalize company registration number like REG - 202602 -> REG-202602."""
+    if not value:
+        return None
 
-    for pattern in patterns:
-        match = re.search(pattern, line)
-        if match:
-            return match.group(1)
+    value = str(value).strip()
+    value = re.sub(r"\s*[-–—]\s*", "-", value)
+    value = re.sub(r"\s+", "", value)
+    value = value.upper()
+
+    if re.fullmatch(r"[A-Z]{1,10}-\d{3,15}", value):
+        return value
+
+    if re.fullmatch(r"\d{3,15}", value):
+        return value
 
     return None
 
 
+def _extract_registration_number(line: str) -> Optional[str]:
+    """
+    Extract company registration number.
+
+    Supports:
+    - رقم التسجيل: 123456
+    - رقم التسجيل: REG-202602
+    - REG-202602 : رقم التسجيل
+    """
+    if not line:
+        return None
+
+    patterns = [
+        r"(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)\s*[:：]?\s*(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})",
+        r"(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})\s*[:：]?\s*(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, line, flags=re.IGNORECASE)
+
+        if match:
+            return _normalize_registration_number(match.group("value"))
+
+    return None
+
+# ---------------------------------------------------------------------------
+# Method 0: Structured target list extraction
+# ---------------------------------------------------------------------------
+
+_TARGET_SECTION_KEYWORDS = [
+    "الأشخاص / الجهات المطلوبة",
+    "الاشخاص / الجهات المطلوبة",
+    "الأشخاص/ الجهات المطلوبة",
+    "الاشخاص/ الجهات المطلوبة",
+    "الأشخاص الجهات المطلوبة",
+    "الاشخاص الجهات المطلوبة",
+    "الأشخاص المطلوبة",
+    "الاشخاص المطلوبة",
+    "الجهات المطلوبة",
+    "الجهات المطلوبه",
+]
+
+
+_RECIPIENT_OR_GREETING_PHRASES = [
+    "إلى السادة",
+    "الى السادة",
+    "السادة",
+    "شركة المحفظة الالكترونية",
+    "شركة المحفظة الإلكترونية",
+    "تحية طيبة",
+    "تحية طبية",
+    "وبعد",
+]
+
+
+_SECTION_END_KEYWORDS = [
+    "مرفق",
+    "وتفضلوا",
+    "ختم",
+    "كاتب",
+    "صفحة",
+    "يرجى اعتماد",
+    "هذه الصفحة",
+]
+
+
+def _is_recipient_or_greeting_line(line: str) -> bool:
+    """Reject recipient/greeting lines that are not target persons."""
+    if not line:
+        return False
+
+    if find_national_ids(line):
+        return False
+
+    if _extract_registration_number(line):
+        return False
+
+    return any(phrase in line for phrase in _RECIPIENT_OR_GREETING_PHRASES)
+
+
+def _is_section_end(line: str) -> bool:
+    if not line:
+        return False
+
+    return any(keyword in line for keyword in _SECTION_END_KEYWORDS)
+
+
+def _get_target_section_lines(cleaned_text: str) -> List[str]:
+    """
+    Return only the target persons/companies section.
+
+    If OCR misses the exact section title, still use the full text but stop
+    before footer/signature.
+    """
+    if not cleaned_text:
+        return []
+
+    search_text = cleaned_text
+
+    for keyword in _TARGET_SECTION_KEYWORDS:
+        if keyword in cleaned_text:
+            search_text = cleaned_text.split(keyword, 1)[1]
+            break
+
+    lines = [line.strip() for line in search_text.splitlines() if line.strip()]
+
+    target_lines = []
+
+    for line in lines:
+        if _is_section_end(line):
+            break
+
+        target_lines.append(line)
+
+    return target_lines
+
+
+def _is_noise_word(word: str, allow_company_word: bool = False) -> bool:
+    if allow_company_word and word == "شركة":
+        return False
+
+    return (
+        word in _STRUCTURED_LABEL_NOISE
+        or word in INVALID_NAME_WORDS
+        or word in _NAME_NOISE_WORDS
+    )
+
+
+def _extract_name_segments(
+    text: str,
+    allow_company_word: bool = False,
+) -> List[List[str]]:
+    """
+    Split Arabic words into possible name segments.
+    Noise words break the segment.
+    """
+    if not text:
+        return []
+
+    text = text.replace("|", " ")
+    text = text.replace(":", " ")
+    text = text.replace("：", " ")
+    text = text.replace("-", " ")
+    text = text.replace("،", " ")
+    text = NATIONAL_ID_PATTERN.sub(" ", text)
+    text = re.sub(r"[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}", " ", text)
+    text = _normalize_spaces(text)
+
+    words = _ARABIC_WORD_PATTERN.findall(text)
+    words = [_fix_ocr_name_word(word) for word in words]
+
+    segments: List[List[str]] = []
+    current: List[str] = []
+
+    for word in words:
+        if _is_noise_word(word, allow_company_word=allow_company_word):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+
+        current.append(word)
+
+    if current:
+        segments.append(current)
+
+    return segments
+
+
+def _clean_structured_person_name(raw_name: str) -> Optional[str]:
+    """Clean a person name captured from structured target-list rows."""
+    segments = _extract_name_segments(raw_name, allow_company_word=False)
+
+    valid_segments = []
+
+    for segment in segments:
+        if len(segment) >= 3:
+            name = _normalize_spaces(" ".join(segment[-6:]))
+
+            if is_valid_person_name(name, has_national_id=True):
+                valid_segments.append(name)
+
+    if not valid_segments:
+        return None
+
+    return valid_segments[-1]
+
+
+def _clean_structured_company_name(raw_name: str) -> Optional[str]:
+    """Clean company name from structured target-list rows."""
+    segments = _extract_name_segments(raw_name, allow_company_word=True)
+
+    candidates = []
+
+    for segment in segments:
+        if len(segment) < 2:
+            continue
+
+        name = _normalize_spaces(" ".join(segment[-8:]))
+
+        if any(keyword in name for keyword in COMPANY_KEYWORDS):
+            candidates.append(name)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: len(item.split()))
+
+
+def _extract_name_near_national_id(
+    section_text: str,
+    national_id: str,
+) -> Optional[str]:
+    """
+    Extract individual name around National ID from flattened target section.
+
+    Handles OCR order issues:
+    - name before ID
+    - name after ID
+    - fields split into different lines
+    """
+    if not section_text or not national_id:
+        return None
+
+    id_pos = section_text.find(national_id)
+
+    if id_pos == -1:
+        return None
+
+    before_id = section_text[max(0, id_pos - 220):id_pos]
+    after_id = section_text[id_pos + len(national_id): id_pos + len(national_id) + 180]
+
+    # Usually Arabic form has name before "الرقم الوطني".
+    before_name = _clean_structured_person_name(before_id)
+
+    if before_name:
+        return before_name
+
+    after_name = _clean_structured_person_name(after_id)
+
+    if after_name:
+        return after_name
+
+    return None
+
+
+def _find_registration_numbers(text: str) -> List[str]:
+    if not text:
+        return []
+
+    patterns = [
+        r"(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)\s*[:：]?\s*(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})",
+        r"(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})\s*[:：]?\s*(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)",
+    ]
+
+    values = []
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            value = _normalize_registration_number(match.group("value"))
+
+            if value and value not in values:
+                values.append(value)
+
+    return values
+
+
+def _extract_company_name_near_registration(
+    section_text: str,
+    registration_number: str,
+) -> Optional[str]:
+    """
+    Extract company name around registration number.
+
+    Example:
+    شركة النجمة للحلول التقنية | رقم التسجيل: REG-202602 | نوع الشخص: شركة
+    """
+    if not section_text or not registration_number:
+        return None
+
+    reg_pos = section_text.find(registration_number)
+
+    if reg_pos == -1:
+        return None
+
+    before_reg = section_text[max(0, reg_pos - 220):reg_pos]
+    after_reg = section_text[reg_pos + len(registration_number): reg_pos + len(registration_number) + 120]
+
+    before_company = _clean_structured_company_name(before_reg)
+
+    if before_company:
+        return before_company
+
+    after_company = _clean_structured_company_name(after_reg)
+
+    if after_company:
+        return after_company
+
+    return None
+
+
+def _extract_structured_list_records(cleaned_text: str) -> List[PersonRecord]:
+    """
+    Extract target rows from:
+    الأشخاص / الجهات المطلوبة:
+    - name | الرقم الوطني: id | نوع الشخص: فرد
+    - company name | رقم التسجيل: REG-202602 | نوع الشخص: شركة
+    """
+    if not cleaned_text:
+        return []
+
+    records: List[PersonRecord] = []
+
+    target_lines = _get_target_section_lines(cleaned_text)
+    section_text = _normalize_spaces(" ".join(target_lines))
+
+    if not section_text:
+        return []
+
+    # ------------------------------------------------------------
+    # Individuals: National ID-based extraction.
+    # ------------------------------------------------------------
+    national_ids = []
+
+    for national_id in find_national_ids(section_text):
+        if national_id not in national_ids:
+            national_ids.append(national_id)
+
+    for national_id in national_ids:
+        full_name = _extract_name_near_national_id(section_text, national_id)
+
+        if not full_name:
+            continue
+
+        records.append(
+            _make_person_record(
+                full_name=full_name,
+                national_id=national_id,
+                registration_number=None,
+                person_type="Individual",
+                confidence=0.90,
+                needs_review=False,
+                source="rules",
+                extraction_method="structured_target_list",
+            )
+        )
+
+    # ------------------------------------------------------------
+    # Companies: Registration Number-based extraction.
+    # ------------------------------------------------------------
+    registration_numbers = _find_registration_numbers(section_text)
+
+    for registration_number in registration_numbers:
+        company_name = _extract_company_name_near_registration(
+            section_text,
+            registration_number,
+        )
+
+        if not company_name:
+            continue
+
+        records.append(
+            _make_person_record(
+                full_name=company_name,
+                national_id=None,
+                registration_number=registration_number,
+                person_type="Company",
+                confidence=0.90,
+                needs_review=False,
+                source="rules",
+                extraction_method="structured_target_list",
+            )
+        )
+
+    return _deduplicate_records(records)
 # ---------------------------------------------------------------------------
 # Method 1: Direct legal phrase + name + National ID
 # ---------------------------------------------------------------------------
@@ -320,8 +782,7 @@ def _clean_direct_match_name(raw_name: str) -> Optional[str]:
     if not words:
         return None
 
-    name = " ".join(words).strip()
-    name = _normalize_spaces(name)
+    name = _normalize_spaces(" ".join(words))
 
     if not is_valid_person_name(
         name,
@@ -338,7 +799,6 @@ def _extract_direct_legal_phrase_records(cleaned_text: str) -> List[PersonRecord
         return []
 
     search_text = re.sub(r"\s+", " ", cleaned_text)
-
     records: List[PersonRecord] = []
     seen_ids = set()
 
@@ -386,11 +846,16 @@ def _clean_name(line: str, keyword: str) -> Optional[str]:
         name_part = line
 
     id_match = NATIONAL_ID_PATTERN.search(name_part)
+
     if id_match:
         name_part = name_part[:id_match.start()]
 
-    name_part = _cut_before_stop_words(name_part)
+    registration_number = _extract_registration_number(name_part)
 
+    if registration_number:
+        name_part = name_part.replace(registration_number, " ")
+
+    name_part = _cut_before_stop_words(name_part)
     name_part = NATIONAL_ID_PATTERN.sub(" ", name_part)
     name_part = name_part.replace("(", " ").replace(")", " ")
     name_part = name_part.replace("[", " ").replace("]", " ")
@@ -402,8 +867,7 @@ def _clean_name(line: str, keyword: str) -> Optional[str]:
     words = _ARABIC_WORD_PATTERN.findall(name_part)
     words = _clean_words(words)
 
-    name = " ".join(words).strip()
-    name = _normalize_spaces(name)
+    name = _normalize_spaces(" ".join(words))
 
     if len(name) < 5:
         return None
@@ -412,6 +876,9 @@ def _clean_name(line: str, keyword: str) -> Optional[str]:
 
 
 def _build_record_from_line(line: str) -> Optional[PersonRecord]:
+    if _is_recipient_or_greeting_line(line):
+        return None
+
     keyword = _matched_keyword(line)
 
     if keyword is None:
@@ -475,7 +942,6 @@ def _extract_name_from_id_line_context(
     lines: List[str],
     line_index: int,
 ) -> Optional[Tuple[str, str]]:
-    """Extract name from previous + current + next line around a National ID."""
     line = lines[line_index]
     ids_on_line = find_national_ids(line)
 
@@ -487,7 +953,7 @@ def _extract_name_from_id_line_context(
     prev_line = lines[line_index - 1] if line_index > 0 else ""
     next_line = lines[line_index + 1] if line_index + 1 < len(lines) else ""
 
-    context = f"{prev_line} {line} {next_line}"
+    context = f"{line} {next_line} {prev_line}"
     context = context.replace("(", " ").replace(")", " ")
     context = context.replace("،", " ")
     context = _normalize_spaces(context)
@@ -498,34 +964,33 @@ def _extract_name_from_id_line_context(
         return None
 
     before_id = context[:id_pos].strip()
+    after_id = context[id_pos + len(national_id):].strip()
 
-    name_part = before_id
+    name_candidates = [before_id, after_id]
 
-    for hint in _PERSON_HINTS:
-        if hint in before_id:
-            name_part = before_id.split(hint, 1)[1]
-            break
-    else:
-        fallback_words = _ARABIC_WORD_PATTERN.findall(before_id)
-        name_part = " ".join(fallback_words[-8:])
+    for candidate_text in name_candidates:
+        name_part = candidate_text
 
-    name_part = _cut_before_stop_words(name_part)
+        for hint in _PERSON_HINTS:
+            if hint in name_part:
+                name_part = name_part.split(hint, 1)[1]
+                break
 
-    words = _ARABIC_WORD_PATTERN.findall(name_part)
-    words = _clean_words(words)
+        name_part = _cut_before_stop_words(name_part)
 
-    if len(words) < MIN_NAME_WORDS:
-        return None
+        words = _ARABIC_WORD_PATTERN.findall(name_part)
+        words = _clean_words(words)
 
-    words = words[-5:]
+        if len(words) < MIN_NAME_WORDS:
+            continue
 
-    name = " ".join(words).strip()
-    name = _normalize_spaces(name)
+        words = words[-5:]
+        name = _normalize_spaces(" ".join(words))
 
-    if not is_valid_person_name(name, has_national_id=True):
-        return None
+        if is_valid_person_name(name, has_national_id=True):
+            return name, national_id
 
-    return name, national_id
+    return None
 
 
 def _extract_context_records(cleaned_text: str, skip_ids: set) -> List[PersonRecord]:
@@ -570,12 +1035,6 @@ def _extract_context_records(cleaned_text: str, skip_ids: set) -> List[PersonRec
 # ---------------------------------------------------------------------------
 
 def _is_valid_emergency_person_name(name: Optional[str]) -> bool:
-    """
-    Relaxed validation for emergency fallback.
-
-    Used only when a valid National ID exists but stricter extraction methods
-    failed. Allows 2+ Arabic words because OCR may miss part of the full name.
-    """
     if not name:
         return False
 
@@ -585,6 +1044,9 @@ def _is_valid_emergency_person_name(name: Optional[str]) -> bool:
         return False
 
     if any(word in INVALID_NAME_WORDS for word in words):
+        return False
+
+    if any(word in _STRUCTURED_LABEL_NOISE for word in words):
         return False
 
     if all(word in _NAME_NOISE_WORDS for word in words):
@@ -597,19 +1059,6 @@ def _extract_emergency_national_id_records(
     cleaned_text: str,
     skip_ids: set,
 ) -> List[PersonRecord]:
-    """
-    Last-resort extraction.
-
-    Used when:
-    - National ID exists in OCR text
-    - direct phrase extraction failed
-    - keyword-line extraction failed
-    - line-context extraction failed
-
-    Strategy:
-    Take a wider text window before each National ID and recover the closest
-    Arabic name before the ID. Result is marked needs_review=True.
-    """
     if not cleaned_text:
         return []
 
@@ -623,93 +1072,213 @@ def _extract_emergency_national_id_records(
             continue
 
         id_pos = text.find(national_id)
+
         if id_pos == -1:
             continue
 
         before_id = text[max(0, id_pos - 450):id_pos]
+        after_id = text[id_pos + len(national_id): id_pos + len(national_id) + 180]
 
-        hint_positions = []
+        candidate_texts = [after_id, before_id]
 
-        for hint in _PERSON_HINTS:
-            pos = before_id.rfind(hint)
-            if pos != -1:
-                hint_positions.append((pos, hint))
+        for candidate_text in candidate_texts:
+            candidate_text = _cut_before_stop_words(candidate_text)
+            candidate_text = candidate_text.replace("(", " ")
+            candidate_text = candidate_text.replace(")", " ")
+            candidate_text = candidate_text.replace("[", " ")
+            candidate_text = candidate_text.replace("]", " ")
+            candidate_text = candidate_text.replace("،", " ")
+            candidate_text = candidate_text.replace(":", " ")
+            candidate_text = candidate_text.replace("-", " ")
+            candidate_text = _normalize_spaces(candidate_text)
 
-        found_person_hint = False
+            words = _ARABIC_WORD_PATTERN.findall(candidate_text)
+            words = _clean_words(words)
 
-        if hint_positions:
-            pos, hint = sorted(hint_positions, key=lambda x: x[0])[-1]
-            name_part = before_id[pos + len(hint):]
-            found_person_hint = True
-        else:
-            name_part = before_id
-
-        name_part = _cut_before_stop_words(name_part)
-
-        name_part = name_part.replace("(", " ")
-        name_part = name_part.replace(")", " ")
-        name_part = name_part.replace("[", " ")
-        name_part = name_part.replace("]", " ")
-        name_part = name_part.replace("،", " ")
-        name_part = name_part.replace(":", " ")
-        name_part = name_part.replace("-", " ")
-        name_part = _normalize_spaces(name_part)
-
-        words = _ARABIC_WORD_PATTERN.findall(name_part)
-        words = _clean_words(words)
-
-        if not words:
-            continue
-
-        segments = []
-        current_segment = []
-
-        for word in words:
-            if word in INVALID_NAME_WORDS:
-                if current_segment:
-                    segments.append(current_segment)
-                    current_segment = []
+            if not words:
                 continue
 
-            current_segment.append(word)
+            segments = []
+            current_segment = []
 
-        if current_segment:
-            segments.append(current_segment)
+            for word in words:
+                if word in INVALID_NAME_WORDS or word in _STRUCTURED_LABEL_NOISE:
+                    if current_segment:
+                        segments.append(current_segment)
+                        current_segment = []
+                    continue
 
-        valid_segments = []
+                current_segment.append(word)
 
-        for segment in segments:
-            min_words = 2 if found_person_hint else 3
+            if current_segment:
+                segments.append(current_segment)
 
-            if len(segment) >= min_words:
-                valid_segments.append(segment)
+            valid_segments = [
+                segment
+                for segment in segments
+                if len(segment) >= 3
+            ]
 
-        if not valid_segments:
-            continue
+            if not valid_segments:
+                continue
 
-        selected_words = valid_segments[-1]
-        selected_words = selected_words[-5:]
+            selected_words = valid_segments[0] if candidate_text == after_id else valid_segments[-1]
+            selected_words = selected_words[-5:]
 
-        full_name = " ".join(selected_words).strip()
-        full_name = _normalize_spaces(full_name)
+            full_name = _normalize_spaces(" ".join(selected_words))
 
-        if not _is_valid_emergency_person_name(full_name):
-            continue
+            if not _is_valid_emergency_person_name(full_name):
+                continue
 
-        records.append(
-            _make_person_record(
-                full_name=full_name,
-                national_id=national_id,
-                registration_number=None,
-                person_type="Individual",
-                confidence=0.65,
-                needs_review=True,
-                source="rules",
-                extraction_method="emergency_national_id_context",
+            records.append(
+                _make_person_record(
+                    full_name=full_name,
+                    national_id=national_id,
+                    registration_number=None,
+                    person_type="Individual",
+                    confidence=0.65,
+                    needs_review=True,
+                    source="rules",
+                    extraction_method="emergency_national_id_context",
+                )
             )
-        )
+            break
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# OCR orphan first-name recovery
+# ---------------------------------------------------------------------------
+
+_COMMON_FIRST_NAMES = {
+    "عمر",
+    "محمد",
+    "احمد",
+    "أحمد",
+    "خالد",
+    "نور",
+    "هدى",
+    "هدا",
+    "ابراهيم",
+    "إبراهيم",
+    "سامي",
+    "ناصر",
+    "مازن",
+    "محمود",
+    "عبدالله",
+    "عبد",
+    "سارة",
+    "رنا",
+}
+
+
+_ORPHAN_NOISE_WORDS = {
+    "الرقم",
+    "الوطني",
+    "فرد",
+    "نوع",
+    "الشخص",
+    "ختم",
+    "كاتب",
+    "المحكمة",
+    "صفحة",
+    "أمر",
+    "امر",
+    "أموال",
+    "اموال",
+    "على",
+    "اللازمة",
+    "وتزويدنا",
+    "افي",
+    "في",
+}
+
+
+def _extract_orphan_first_names(cleaned_text: str) -> List[str]:
+    if not cleaned_text:
+        return []
+
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    candidates: List[str] = []
+
+    start_index = 0
+
+    for i, line in enumerate(lines):
+        if "الأشخاص" in line or "الاشخاص" in line or "الجهات المطلوبة" in line:
+            start_index = i
+            break
+
+    for line in lines[start_index:]:
+        words = _ARABIC_WORD_PATTERN.findall(line)
+
+        if len(words) != 1:
+            continue
+
+        word = _fix_ocr_name_word(words[0])
+
+        if word in _ORPHAN_NOISE_WORDS:
+            continue
+
+        if word in _COMMON_FIRST_NAMES:
+            candidates.append(word)
+
+    unique = []
+
+    for word in candidates:
+        if word not in unique:
+            unique.append(word)
+
+    return unique
+
+
+def _recover_orphan_first_names(
+    records: List[PersonRecord],
+    cleaned_text: str,
+) -> List[PersonRecord]:
+    orphan_first_names = _extract_orphan_first_names(cleaned_text)
+
+    if not orphan_first_names:
+        return records
+
+    updated_records: List[PersonRecord] = []
+    orphan_index = 0
+
+    for record in records:
+        full_name = record.full_name or ""
+        words = full_name.split()
+
+        should_try_recovery = (
+            record.person_type == "Individual"
+            and bool(record.national_id)
+            and len(words) == 3
+            and getattr(record, "extraction_method", None) in {
+                "structured_target_list",
+                "national_id_context",
+                "emergency_national_id_context",
+            }
+        )
+
+        if should_try_recovery and orphan_index < len(orphan_first_names):
+            first_name = orphan_first_names[orphan_index]
+
+            if first_name not in words:
+                new_name = _normalize_spaces(f"{first_name} {full_name}")
+
+                record = _copy_record_with_updates(
+                    record,
+                    full_name=new_name,
+                    confidence=0.85,
+                    needs_review=True,
+                    source=record.source,
+                    extraction_method="orphan_first_name_recovered",
+                )
+
+                orphan_index += 1
+
+        updated_records.append(record)
+
+    return updated_records
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +1288,7 @@ def _extract_emergency_national_id_records(
 def _record_name_word_count(record: PersonRecord) -> int:
     if not record.full_name:
         return 0
+
     return len(record.full_name.split())
 
 
@@ -728,8 +1298,14 @@ def _record_score(record: PersonRecord) -> int:
     if record.national_id:
         score += 10
 
+    if record.registration_number:
+        score += 10
+
     if record.source == "rules":
         score += 6
+
+    if getattr(record, "extraction_method", None) == "structured_target_list":
+        score += 5
 
     if getattr(record, "extraction_method", None) == "direct_legal_phrase":
         score += 4
@@ -743,26 +1319,31 @@ def _record_score(record: PersonRecord) -> int:
 
 
 def _deduplicate_records(records: List[PersonRecord]) -> List[PersonRecord]:
-    best_by_id = {}
-    no_id_records: List[PersonRecord] = []
+    best_by_key = {}
+    no_key_records: List[PersonRecord] = []
 
     for record in records:
         if record.national_id:
-            key = record.national_id
+            key = f"id:{record.national_id}"
+        elif record.registration_number:
+            key = f"reg:{record.registration_number}"
+        else:
+            key = None
 
-            if key not in best_by_id:
-                best_by_id[key] = record
+        if key:
+            if key not in best_by_key:
+                best_by_key[key] = record
                 continue
 
-            if _record_score(record) > _record_score(best_by_id[key]):
-                best_by_id[key] = record
+            if _record_score(record) > _record_score(best_by_key[key]):
+                best_by_key[key] = record
         else:
-            no_id_records.append(record)
+            no_key_records.append(record)
 
-    unique_records = list(best_by_id.values())
+    unique_records = list(best_by_key.values())
     seen_names = {record.full_name for record in unique_records if record.full_name}
 
-    for record in no_id_records:
+    for record in no_key_records:
         if not record.full_name:
             continue
 
@@ -790,6 +1371,22 @@ def extract_person_candidates(cleaned_text: str) -> List[PersonRecord]:
 
     records: List[PersonRecord] = []
 
+    # Method 0: structured target list rows.
+    structured_records = _extract_structured_list_records(cleaned_text)
+    records.extend(structured_records)
+
+    structured_ids = {
+        record.national_id
+        for record in structured_records
+        if record.national_id
+    }
+
+    structured_registration_numbers = {
+        record.registration_number
+        for record in structured_records
+        if record.registration_number
+    }
+
     # Method 1: direct phrase + name + National ID.
     direct_records = _extract_direct_legal_phrase_records(cleaned_text)
     records.extend(direct_records)
@@ -798,7 +1395,7 @@ def extract_person_candidates(cleaned_text: str) -> List[PersonRecord]:
         record.national_id
         for record in direct_records
         if record.national_id
-    }
+    } | structured_ids
 
     # Method 2: keyword lines.
     candidate_lines = extract_candidate_lines(cleaned_text)
@@ -806,8 +1403,16 @@ def extract_person_candidates(cleaned_text: str) -> List[PersonRecord]:
     for line in candidate_lines:
         record = _build_record_from_line(line)
 
-        if record:
-            records.append(record)
+        if not record:
+            continue
+
+        if record.national_id and record.national_id in structured_ids:
+            continue
+
+        if record.registration_number and record.registration_number in structured_registration_numbers:
+            continue
+
+        records.append(record)
 
     # Method 3: fallback around National ID lines.
     context_records = _extract_context_records(
@@ -829,4 +1434,7 @@ def extract_person_candidates(cleaned_text: str) -> List[PersonRecord]:
     )
     records.extend(emergency_records)
 
-    return _deduplicate_records(records)
+    final_records = _deduplicate_records(records)
+    final_records = _recover_orphan_first_names(final_records, cleaned_text)
+
+    return _deduplicate_records(final_records)

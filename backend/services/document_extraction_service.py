@@ -31,11 +31,46 @@ from utils.regex_patterns import (
 
 
 # ---------------------------------------------------------------------------
-# Case / document number patterns
+# Strong case / document number patterns
 # ---------------------------------------------------------------------------
 
+# Example:
+# رقم القضية : 1204/2026
+# 1204/2026 : رقم القضية
+CASE_NUMBER_PATTERNS = [
+    re.compile(
+        r"(?:رقم\s*القضية|رقم\s*الدعوى|القضية\s*رقم|الدعوى\s*رقم|دعوى\s*رقم|بالدعوى\s*رقم|بدعوى\s*رقم)"
+        r"\s*[:：]?\s*"
+        r"(?P<value>\d{1,6}\s*/\s*(?:20\d{2}|19\d{2})|(?:20\d{2}|19\d{2})\s*/\s*\d{1,6})"
+    ),
+    re.compile(
+        r"(?P<value>\d{1,6}\s*/\s*(?:20\d{2}|19\d{2})|(?:20\d{2}|19\d{2})\s*/\s*\d{1,6})"
+        r"\s*[:：]?\s*"
+        r"(?:رقم\s*القضية|رقم\s*الدعوى|القضية\s*رقم|الدعوى\s*رقم|دعوى\s*رقم|بالدعوى\s*رقم|بدعوى\s*رقم)"
+    ),
+]
+
+# Example:
+# رقم الكتاب : UW-2026-0004
+# UW-2026-0004 : رقم الكتاب
+DOCUMENT_NUMBER_PATTERNS = [
+    re.compile(
+        r"(?:رقم\s*الكتاب|كتاب\s*رقم|رقم\s*الصادر|الكتاب)"
+        r"\s*[:：]?\s*"
+        r"(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{4}\s*[-–—]\s*\d{3,10})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{4}\s*[-–—]\s*\d{3,10})"
+        r"\s*[:：]?\s*"
+        r"(?:رقم\s*الكتاب|كتاب\s*رقم|رقم\s*الصادر|الكتاب)",
+        re.IGNORECASE,
+    ),
+]
+
+# Generic fallback for old court cases like 2026/41.
 _CASE_WITH_SEPARATOR_PATTERN = re.compile(
-    r"(?<!\d)((?:20\d{2}|19\d{2})\s*[\/\-]\s*\d{1,6})(?!\d)"
+    r"(?<![\d/])((?:20\d{2}|19\d{2})\s*[\/\-]\s*\d{1,6})(?![\d/])"
 )
 
 _COMPACT_CASE_PATTERN = re.compile(
@@ -48,8 +83,6 @@ _VALUE_AFTER_COLON = re.compile(r"[:：]\s*(.+)$")
 # ---------------------------------------------------------------------------
 # Strong local date fallback patterns
 # ---------------------------------------------------------------------------
-# These are intentionally defined here so date extraction does not fail
-# if regex_patterns.py is missing one OCR case.
 
 _LOCAL_DATE_YMD = re.compile(
     r"(?<!\d)((?:20\d{2}|19\d{2})[\/\-.](0?[1-9]|1[0-2])[\/\-.](0?[1-9]|[12]\d|3[01]))(?!\d)"
@@ -72,7 +105,6 @@ OCR_DATE_KEYWORD_VARIANTS = [
     "تاريخ",
     "بتاريخ",
     "الموافق",
-    # Common OCR mistakes:
     "التاربخ",
     "التاربح",
     "التاريح",
@@ -94,7 +126,6 @@ def _empty_field() -> ExtractedField:
 
 def _field(value: Optional[str], confidence: float, review: Optional[bool] = None) -> ExtractedField:
     if not value:
-        
         return _empty_field()
 
     value = str(value).strip()
@@ -161,18 +192,15 @@ def _build_search_area(lines: List[str], index: int) -> str:
     return " ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Case / document number extraction
-# ---------------------------------------------------------------------------
-
 def _normalize_case_number(raw_value: str) -> Optional[str]:
     """
-    Normalize case/document number.
+    Normalize case number.
 
-    Examples:
-    - 2026/41 -> 2026/41
-    - 2026 - 41 -> 2026/41
-    - 202641 بداية -> 2026/41
+    Supports:
+    - 1204/2026
+    - 2026/41
+    - 2026 - 41
+    - 202641
     """
     if not raw_value:
         return None
@@ -180,14 +208,19 @@ def _normalize_case_number(raw_value: str) -> Optional[str]:
     value = str(raw_value).strip()
     value = re.sub(r"\s+", " ", value)
 
-    sep_match = _CASE_WITH_SEPARATOR_PATTERN.search(value)
+    # Direct slash/hyphen case number.
+    direct_match = re.search(
+        r"(?<![\d/])(?P<value>\d{1,6}\s*[\/\-]\s*\d{1,6})(?![\d/])",
+        value,
+    )
 
-    if sep_match:
-        number = sep_match.group(1)
+    if direct_match:
+        number = direct_match.group("value")
         number = re.sub(r"\s+", "", number)
         number = number.replace("-", "/")
         return number
 
+    # Old format: 202641 -> 2026/41
     compact_match = _COMPACT_CASE_PATTERN.search(value)
 
     if compact_match:
@@ -202,6 +235,27 @@ def _normalize_case_number(raw_value: str) -> Optional[str]:
 
         if rest:
             return f"{year}/{rest}"
+
+    return None
+
+
+def _normalize_document_number(value: str) -> Optional[str]:
+    """
+    Normalize official document/book number.
+
+    Example:
+    UW - 2026 - 0004 -> UW-2026-0004
+    """
+    if not value:
+        return None
+
+    value = str(value).strip()
+    value = re.sub(r"\s*[-–—]\s*", "-", value)
+    value = re.sub(r"\s+", "", value)
+    value = value.upper()
+
+    if re.fullmatch(r"[A-Z]{1,10}-\d{4}-\d{3,10}", value):
+        return value
 
     return None
 
@@ -238,7 +292,7 @@ def _normalize_date_string(raw_date: str) -> Optional[str]:
         rest = match.group(2).zfill(4)
         return f"{year}/{rest[0:2]}/{rest[2:4]}"
 
-    # 2026/02/04
+    # 2026/02/04 or 05/07/2026
     parts = value.split("/")
 
     if len(parts) == 3:
@@ -269,7 +323,6 @@ def _normalize_date_value(text: str) -> Optional[str]:
     if not text:
         return None
 
-    # First use existing project patterns.
     match = DATE_PATTERN_YMD.search(text)
 
     if match:
@@ -288,7 +341,6 @@ def _normalize_date_value(text: str) -> Optional[str]:
         year, month, day = match.group(1), match.group(2), match.group(3)
         return f"{year}/{int(month):02d}/{int(day):02d}"
 
-    # Then use stronger local fallbacks.
     match = _LOCAL_DATE_YMD.search(text)
 
     if match:
@@ -335,7 +387,7 @@ def _extract_first_date_anywhere(text: Optional[str]) -> Optional[str]:
 def _extract_court_name(lines: List[str]) -> ExtractedField:
     """
     Court name is usually in document header.
-    Example: محكمة اربد الابتدائية
+    Example: محكمة بداية العقبة
     """
     for line in lines[:15]:
         clean_line = line.strip()
@@ -355,10 +407,25 @@ def _extract_court_name(lines: List[str]) -> ExtractedField:
 
 def _extract_case_number(lines: List[str]) -> ExtractedField:
     """
-    Extract case number from phrases like:
+    Extract case number.
+
+    Expected examples:
+    - رقم القضية : 1204/2026
     - بالدعوى رقم 2026/41
-    - دعوى رقم 202641 بداية
     """
+    full_text = "\n".join(lines)
+
+    # 1. Strong patterns with explicit case keywords.
+    for pattern in CASE_NUMBER_PATTERNS:
+        match = pattern.search(full_text)
+
+        if match:
+            value = _normalize_case_number(match.group("value"))
+
+            if value:
+                return _field(value, 0.90, False)
+
+    # 2. Keyword-line fallback.
     for i, line in enumerate(lines):
         for keyword in CASE_NUMBER_KEYWORDS:
             if keyword in line:
@@ -373,7 +440,17 @@ def _extract_case_number(lines: List[str]) -> ExtractedField:
 
                 return _field(None, NEARBY_MATCH_CONFIDENCE, True)
 
+    # 3. Weak fallback: avoid document-number/date lines.
     for line in lines:
+        if any(keyword in line for keyword in DOCUMENT_NUMBER_KEYWORDS):
+            continue
+
+        if "الكتاب" in line:
+            continue
+
+        if _normalize_date_value(line):
+            continue
+
         value = _extract_case_like_value(line)
 
         if value:
@@ -383,27 +460,41 @@ def _extract_case_number(lines: List[str]) -> ExtractedField:
 
 
 def _extract_document_number(lines: List[str]) -> ExtractedField:
-    header_lines = lines[:20]
+    """
+    Extract official document/book number.
 
-    for i, line in enumerate(header_lines):
-        for keyword in DOCUMENT_NUMBER_KEYWORDS:
-            if keyword in line:
-                value_after_keyword = _find_value_on_line(line, keyword)
-                value = _extract_case_like_value(value_after_keyword or line)
+    Expected examples:
+    - رقم الكتاب : UW-2026-0004
+    - UW-2026-0004 : رقم الكتاب
 
-                if not value and i + 1 < len(header_lines):
-                    value = _extract_case_like_value(header_lines[i + 1])
+    Important:
+    Do not fallback to case number here.
+    If book number is not found, return empty and require review.
+    """
+    header_lines = lines[:25]
+    header_text = "\n".join(header_lines)
 
-                if value:
-                    return _field(value, EXACT_MATCH_CONFIDENCE, False)
+    # 1. Strong patterns for alphanumeric book/reference numbers.
+    for pattern in DOCUMENT_NUMBER_PATTERNS:
+        match = pattern.search(header_text)
 
-                return _field(None, NEARBY_MATCH_CONFIDENCE, True)
+        if match:
+            value = _normalize_document_number(match.group("value"))
 
-    for line in header_lines[:10]:
-        value = _extract_case_like_value(line)
+            if value:
+                return _field(value, 0.90, False)
 
-        if value:
-            return _field(value, EXACT_MATCH_CONFIDENCE, False)
+    # 2. Search full text if header crop/order missed it.
+    full_text = "\n".join(lines)
+
+    for pattern in DOCUMENT_NUMBER_PATTERNS:
+        match = pattern.search(full_text)
+
+        if match:
+            value = _normalize_document_number(match.group("value"))
+
+            if value:
+                return _field(value, 0.90, False)
 
     return _empty_field()
 
@@ -417,7 +508,6 @@ def _extract_document_date(lines: List[str]) -> ExtractedField:
     2026/02/04
     التاربخ
     """
-    # 1. Keyword-based search with previous/current/next line.
     for i, line in enumerate(lines):
         all_date_keywords = list(DOCUMENT_DATE_KEYWORDS) + OCR_DATE_KEYWORD_VARIANTS
 
@@ -431,7 +521,6 @@ def _extract_document_date(lines: List[str]) -> ExtractedField:
 
                 return _field(None, NEARBY_MATCH_CONFIDENCE, True)
 
-    # 2. Strong fallback: any recognizable date anywhere.
     full_text = "\n".join(lines)
     value = _extract_first_date_anywhere(full_text)
 
@@ -448,16 +537,21 @@ def _extract_document_date(lines: List[str]) -> ExtractedField:
 def extract_document_fields(cleaned_text: str, header_text: Optional[str] = None) -> DocumentInfo:
     """Run document-level extraction over normalized OCR text.
 
-    header_text is searched first for document_date because the header crop is
-    the most reliable place for:
-    - 2026/41
-    - 2026/02/04
-    - التاريخ / التاربخ
+    header_text is searched first for document_date and header fields because
+    the header crop is the most reliable place for:
+    - court name
+    - case number
+    - document/book number
+    - document date
     """
     if cleaned_text is None:
         cleaned_text = ""
 
-    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    if header_text is None:
+        header_text = ""
+
+    combined_text = f"{header_text}\n{cleaned_text}".strip()
+    lines = [line.strip() for line in combined_text.splitlines() if line.strip()]
 
     court_name = _extract_court_name(lines)
     case_number = _extract_case_number(lines)
@@ -465,10 +559,6 @@ def extract_document_fields(cleaned_text: str, header_text: Optional[str] = None
 
     # Date extraction:
     # 1. First extract any date from header_text directly.
-    #    This fixes OCR output like:
-    #    2026/02/04
-    #    :
-    #    التاربخ
     document_date = _empty_field()
 
     if header_text:
@@ -488,11 +578,6 @@ def extract_document_fields(cleaned_text: str, header_text: Optional[str] = None
             document_date = _field(direct_text_date, 0.85, False)
         else:
             document_date = _extract_document_date(lines)
-
-    # Fallback: many court letters reuse the case/reference number as the
-    # header "الرقم" field, but OCR often misses that small header line.
-    if document_number.value is None and case_number.value is not None:
-        document_number = _field(case_number.value, NEARBY_MATCH_CONFIDENCE, True)
 
     return DocumentInfo(
         court_name=court_name,
