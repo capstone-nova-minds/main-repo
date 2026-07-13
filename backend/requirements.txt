@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+pymupdf
+opencv-python-headless
+easyocr
+pytesseract
+pillow
+numpy
+pandas
+openpyxl
+python-dotenv
+stanza
