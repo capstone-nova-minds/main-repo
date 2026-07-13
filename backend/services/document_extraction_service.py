@@ -29,6 +29,8 @@ from utils.regex_patterns import (
     DATE_PATTERN_COMPACT,
 )
 
+_ARABIC_WORD_PATTERN = re.compile(r"[؀-ۿ]{2,}")
+
 
 # ---------------------------------------------------------------------------
 # Strong case / document number patterns
@@ -138,6 +140,12 @@ def _field(value: Optional[str], confidence: float, review: Optional[bool] = Non
         confidence=float(confidence),
         needs_review=bool(review),
     )
+
+
+def _normalize_spaces(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _clean_text_value(value: str) -> Optional[str]:
@@ -384,19 +392,123 @@ def _extract_first_date_anywhere(text: Optional[str]) -> Optional[str]:
 # Field extraction
 # ---------------------------------------------------------------------------
 
+
+# Court "kind" and city are the two parts OCR most often loses. Kind
+# keywords carry more weight than a bare "محكمة" -- that lets us prefer
+# "محكمة بداية" over a truncated "محكمة" line found earlier/nearby.
+_COURT_KIND_KEYWORDS = ["بداية", "صلح", "استئناف", "تنفيذ", "تمييز", "شرعية"]
+
+_COURT_CITY_KEYWORDS = [
+    "عمان", "اربد", "إربد", "الزرقاء", "السلط", "معان", "الكرك",
+    "الطفيلة", "مادبا", "جرش", "عجلون", "العقبة", "المفرق", "الرصيفة",
+]
+
+# Fields that never belong in a court-name line -- truncate before them
+# if OCR ran two fields together on one line.
+_COURT_NAME_STOP_KEYWORDS = [
+    "رقم القضية", "رقم الدعوى", "رقم الكتاب", "رقم الصادر",
+    "التاريخ", "تاريخ", "الموضوع", "كتاب رسمي", "رقم الملف",
+]
+
+# How many lines from the top of the document to look for the court name.
+# Header-crop OCR is prepended twice in the combined text (once alone, once
+# again as part of the full cleaned_text), so the fuller full-page OCR line
+# ("محكمة بداية") can land well past the first 15 lines.
+_COURT_NAME_SEARCH_WINDOW = 40
+
+
+def _truncate_court_line_before_stop_keyword(line: str) -> str:
+    for keyword in _COURT_NAME_STOP_KEYWORDS:
+        idx = line.find(keyword)
+
+        if idx != -1:
+            line = line[:idx]
+
+    return line.strip()
+
+
+def _court_line_score(line: str) -> int:
+    score = 0
+
+    if any(keyword in line for keyword in _COURT_KIND_KEYWORDS):
+        score += 2
+
+    if any(keyword in line for keyword in _COURT_CITY_KEYWORDS):
+        score += 1
+
+    return score
+
+
+def _find_best_court_line(lines: List[str]) -> Optional[str]:
+    """Pick the most complete "محكمة ..." line, not just the first one.
+
+    A bare "محكمة" fragment (common when header-crop OCR splits the
+    header into single-word lines) must lose to a fuller line like
+    "محكمة بداية" found later in the same document.
+    """
+    best_line = None
+    best_score = -1
+
+    for line in lines[:_COURT_NAME_SEARCH_WINDOW]:
+        clean_line = _truncate_court_line_before_stop_keyword(line)
+
+        if "محكمة" not in clean_line:
+            continue
+
+        score = _court_line_score(clean_line)
+
+        if score > best_score or (
+            score == best_score
+            and best_line is not None
+            and len(clean_line) > len(best_line)
+        ):
+            best_score = score
+            best_line = clean_line
+
+    return best_line
+
+
+def _recover_missing_court_city(court_name: str, lines: List[str]) -> Optional[str]:
+    """
+    If the court's kind was found but not its city (OCR scattered the city
+    name onto its own stray line elsewhere), reattach the first standalone
+    city-name line found anywhere in the document.
+    """
+    if any(city in court_name for city in _COURT_CITY_KEYWORDS):
+        return None
+
+    for line in lines:
+        words = _ARABIC_WORD_PATTERN.findall(line.strip())
+
+        if len(words) != 1:
+            continue
+
+        if words[0] in _COURT_CITY_KEYWORDS:
+            return _normalize_spaces(f"{court_name} {words[0]}")
+
+    return None
+
+
 def _extract_court_name(lines: List[str]) -> ExtractedField:
     """
     Court name is usually in document header.
-    Example: محكمة بداية العقبة
+    Example: محكمة بداية عمان
     """
-    for line in lines[:15]:
-        clean_line = line.strip()
+    best_line = _find_best_court_line(lines)
 
-        if "محكمة" in clean_line:
-            return _field(clean_line, EXACT_MATCH_CONFIDENCE, False)
+    if best_line:
+        recovered = _recover_missing_court_city(best_line, lines)
+
+        if recovered:
+            return _field(recovered, 0.90, False)
+
+        if _court_line_score(best_line) >= 2:
+            return _field(best_line, EXACT_MATCH_CONFIDENCE, False)
+
+        return _field(best_line, NEARBY_MATCH_CONFIDENCE, False)
 
     for line in lines:
-        clean_line = line.strip()
+        clean_line = _truncate_court_line_before_stop_keyword(line.strip())
 
         for keyword in COURT_NAME_KEYWORDS:
             if keyword in clean_line:

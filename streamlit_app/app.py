@@ -2,29 +2,51 @@
 
 import streamlit as st
 
+from utils.styling import apply_theme, render_sidebar_brand, render_header, render_logo
+
 st.set_page_config(page_title="AI Court Order Extraction System", page_icon="⚖️", layout="wide")
 
-st.sidebar.title("AI Court Order Extraction System")
-st.sidebar.info("Local OCR + Rule-based Extraction + Local Arabic NER | No LLM | No Cloud AI")
+apply_theme()
+render_sidebar_brand()
 
-st.title("AI Court Order Extraction System")
-st.write(
-    "This tool extracts structured information from Arabic Jordanian court "
-    "attachment orders, using only local OCR, rule-based extraction, and "
-    "local Arabic NER. No LLM, no cloud AI, and no cloud OCR are used -- "
-    "everything runs on this machine."
+st.markdown(f'<div style="margin-bottom:1rem;">{render_logo(200, 58)}</div>', unsafe_allow_html=True)
+
+render_header(
+    "⚖️",
+    "AI Court Order Extraction System",
+    "Structured data from Arabic Jordanian court attachment orders — fully local, human-reviewed.",
 )
 
-st.subheader("How to use this app")
-st.markdown(
-    """
-    1. **Upload** — go to the **1_Upload** page and upload a PDF/JPG/JPEG/PNG court order.
-    2. **Process** — go to **2_Processing_Status**, click *Start Processing*, and review OCR/NER status.
-    3. **Review** — go to **3_Review_Validation** to check and correct the extracted fields and persons.
-    4. **Export** — go to **4_Export** to download the approved data as JSON and Excel.
+trust_cols = st.columns(4)
+trust_items = [
+    ("🔒", "Fully Local", "Nothing leaves this machine"),
+    ("🚫", "No LLM", "Rule-based + local NER only"),
+    ("☁️", "No Cloud AI", "EasyOCR / Tesseract on-device"),
+    ("👀", "Human Reviewed", "Review is mandatory before export"),
+]
+for col, (icon, title, desc) in zip(trust_cols, trust_items):
+    with col:
+        with st.container(border=True):
+            st.markdown(f"**{icon} {title}**")
+            st.caption(desc)
 
-    Use the page navigation in the sidebar to move between steps.
-    """
-)
+st.write("")
+st.subheader("How it works")
 
-st.warning("Human review is mandatory before exporting any result.")
+step_cols = st.columns(4)
+step_items = [
+    ("📤", "1. Upload", "Go to **Upload** and submit a PDF/JPG/JPEG/PNG court order."),
+    ("⚙️", "2. Process", "Open **Processing Status**, click *Start Processing*, and check OCR/NER results."),
+    ("🧾", "3. Review", "Open **Review & Validation** to correct fields and person records."),
+    ("📦", "4. Export", "Open **Export** to download the approved data as JSON and Excel."),
+]
+for col, (icon, title, desc) in zip(step_cols, step_items):
+    with col:
+        with st.container(border=True):
+            st.markdown(f"### {icon}")
+            st.markdown(f"**{title}**")
+            st.caption(desc)
+
+st.write("")
+st.warning("⚠️ Human review is mandatory before exporting any result.")
+st.caption("Use the page navigation in the sidebar to move between steps.")

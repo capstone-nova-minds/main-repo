@@ -25,6 +25,16 @@ _ALEF_VARIANTS = str.maketrans({
 # Important: do NOT remove "/" because it is needed for dates and case numbers.
 _GARBAGE_PATTERN = re.compile(r"[|_~`\^<>{}\[\]]")
 
+# EasyOCR consistently misreads the "W" in this document system's "UW-YYYY-NNNN"
+# document/book number as a vertical bar, e.g. "U|-2026-0101" instead of
+# "UW-2026-0101" -- seen in every sample of this document type. Restore it
+# *before* the generic garbage-symbol strip below deletes the "|" and the
+# "W" is lost for good. Scoped tightly (single Latin letter + "|" + "-" +
+# digit) so it can never touch the "|" used as a field separator elsewhere
+# (e.g. "98000000081 | نوع الشخص"), which never has a letter immediately
+# before it or a hyphen-digit immediately after.
+_MISREAD_W_PATTERN = re.compile(r"(?<=[A-Za-z])\|(?=-\d)")
+
 _MULTI_SPACE_PATTERN = re.compile(r"[ \t]+")
 
 
@@ -68,6 +78,7 @@ def remove_garbage_symbols(text: str) -> str:
     """Strip common OCR noise symbols that never appear in legal text."""
     if not text:
         return text
+    text = _MISREAD_W_PATTERN.sub("W", text)
     return _GARBAGE_PATTERN.sub("", text)
 
 

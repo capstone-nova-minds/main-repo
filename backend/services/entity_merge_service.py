@@ -135,12 +135,23 @@ def _merge_same_key_records(existing: PersonRecord, new: PersonRecord) -> Person
 
     if not best.registration_number and other.registration_number:
         update_data["registration_number"] = other.registration_number
+        # A registration number is real company evidence -- adopt the type
+        # along with it. Never do the reverse (see below): a bare
+        # person_type="Company" flag on the *losing* record, with nothing
+        # backing it, must not overwrite a higher-scored Individual record
+        # that already has a verified National ID.
+        update_data["person_type"] = "Company"
+
+    # `best` already carries its own (higher-scored) person_type -- do not
+    # let the lower-scored `other` record override it just because it
+    # happened to be tagged "Company" (e.g. a NER entity whose proximity
+    # window brushed up against an unrelated company keyword). Companies
+    # use registration_number, not National ID; if `other` claims to be a
+    # Company but never supplied a registration_number, that claim isn't
+    # trustworthy enough to overwrite an already-anchored record.
 
     if not getattr(best, "extraction_method", None) and getattr(other, "extraction_method", None):
         update_data["extraction_method"] = other.extraction_method
-
-    if existing.person_type == "Company" or new.person_type == "Company":
-        update_data["person_type"] = "Company"
 
     if best.national_id and best.full_name and len(best.full_name.split()) >= 3:
         update_data["needs_review"] = False
@@ -364,11 +375,28 @@ def merge_rules_and_ner(
                 )
                 continue
 
+            if is_company_context:
+                # A NER "PERSON" label paired with a National ID *and* a
+                # nearby company keyword is contradictory -- a person
+                # can't be a company. Per the NER integration rules, NER
+                # must never attach a person token to a company, so this
+                # goes to suggested_entities for human review instead of
+                # being merged in as a confident record.
+                suggested_entities.append(
+                    {
+                        "text": entity_text,
+                        "label": label,
+                        "confidence": entity_confidence,
+                        "reason": "person_entity_near_company_context",
+                    }
+                )
+                continue
+
             record = PersonRecord(
                 full_name=entity_text,
                 national_id=nearby_id,
                 registration_number=None,
-                person_type="Company" if is_company_context else "Individual",
+                person_type="Individual",
                 confidence=entity_confidence,
                 needs_review=False,
                 source="ner",

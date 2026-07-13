@@ -3,18 +3,34 @@
 This service extracts persons and companies from normalized OCR text using
 five methods, from most to least precise:
 
-0. Structured target-list extraction.
+0. Structured target-list extraction (line-based logical records).
 1. Direct legal-phrase + name + National ID regex.
 2. Legal-keyword candidate lines.
 3. Line-context extraction around every valid National ID.
 4. Emergency wide-context fallback around National ID.
-5. OCR orphan first-name recovery.
+5. OCR orphan token recovery (first name for individuals, brand word for
+   companies).
 
 No LLM and no cloud AI are used.
+
+Method 0 architecture (per-record, not whole-section):
+    structured section detection
+    -> extract section boundaries
+    -> split section into logical records (line by line)
+    -> parse every logical record independently
+    -> detect identifiers from that same record
+    -> extract name from that same record
+    -> determine person type from that same record
+    -> deduplicate
+
+A logical record is never built by flattening the whole section into one
+string and searching a character window around an identifier -- that is
+what let a name from one row leak into a neighboring row's record. Instead
+each record only ever sees its own lines.
 """
 
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from schemas.person_schema import PersonRecord
 from utils.confidence import (
@@ -26,6 +42,7 @@ from utils.regex_patterns import (
     NATIONAL_ID_PATTERN,
     PERSON_LINE_KEYWORDS,
     COMPANY_KEYWORDS,
+    COMPANY_NAME_KEYWORDS,
 )
 
 
@@ -35,21 +52,34 @@ from utils.regex_patterns import (
 
 _LEADING_NOISE = re.compile(r"^[:\-\s،]+")
 _MULTI_SPACE = re.compile(r"\s+")
-_ARABIC_WORD_PATTERN = re.compile(r"[\u0600-\u06FF]{2,}")
+_ARABIC_WORD_PATTERN = re.compile(r"[؀-ۿ]{2,}")
 
 MIN_NAME_WORDS = 3
 
 
+# Words that are never part of a person's/company's own name -- section
+# labels, field labels, and generic document phrasing. Keeping this in one
+# set means "شركة" (and friends) reliably breaks an *individual* name
+# segment, and generic phrases like "يرجى اتخاذ الإجراءات اللازمة" can
+# never be mistaken for a name.
 _STRUCTURED_LABEL_NOISE = {
     "نوع",
     "الشخص",
     "فرد",
     "شركة",
+    "مؤسسة",
+    "جمعية",
+    "بنك",
+    "مدارس",
+    "مستشفى",
+    "مكتب",
+    "مركز",
     "الرقم",
     "الوطني",
     "رقم",
     "وطني",
     "التسجيل",
+    "تسجيل",
     "الأشخاص",
     "الاشخاص",
     "الجهات",
@@ -80,6 +110,9 @@ _STRUCTURED_LABEL_NOISE = {
     "امر",
     "أمر",
     "اللازمة",
+    "الموضوع",
+    "الكتاب",
+    "القضية",
 }
 
 INVALID_NAME_WORDS = {
@@ -236,7 +269,7 @@ _DIRECT_PHRASE_PATTERNS = [
     re.compile(
         re.escape(phrase)
         + r"\s*[:\-]?\s*"
-        + r"(?P<name>[\u0600-\u06FF\s]{5,120}?)\s*"
+        + r"(?P<name>[؀-ۿ\s]{5,120}?)\s*"
         + _ID_CONNECTOR
         + r"\s*[:\-]?\s*[\(\[]?\s*"
         + r"(?P<id>\d{11})"
@@ -323,18 +356,54 @@ def is_company_line(line: str) -> bool:
     return any(keyword in line for keyword in COMPANY_KEYWORDS)
 
 
+# ---------------------------------------------------------------------------
+# National ID detection (supports OCR digit-group spacing + Arabic-Indic)
+# ---------------------------------------------------------------------------
+
+_ARABIC_INDIC_TRANS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
 def find_national_ids(text: str) -> List[str]:
+    """Find every valid 11-digit National ID in text.
+
+    Handles the common contiguous-digit case directly, and falls back to
+    a digit-normalized pass (Arabic-Indic digits folded to ASCII, single
+    spaces between digit groups collapsed) so OCR artifacts like
+    "9 8 0 0 0..." or Arabic-Indic digits are still recognized -- without
+    weakening the boundary check that rejects longer digit runs.
+    """
     if not text:
         return []
-    return NATIONAL_ID_PATTERN.findall(text)
+
+    ids = list(NATIONAL_ID_PATTERN.findall(text))
+
+    normalized = text.translate(_ARABIC_INDIC_TRANS)
+    normalized = re.sub(r"(?<=[0-9])\s(?=[0-9])", "", normalized)
+
+    for candidate in NATIONAL_ID_PATTERN.findall(normalized):
+        if candidate not in ids:
+            ids.append(candidate)
+
+    return ids
+
+
+def _first_national_id(line: str) -> Optional[str]:
+    ids = find_national_ids(line)
+    return ids[0] if ids else None
 
 
 def is_valid_person_name(
     name: Optional[str],
     has_national_id: bool = False,
     direct_pattern_match: bool = False,
+    min_words: int = MIN_NAME_WORDS,
 ) -> bool:
-    """Reject false positives like headers/legal words."""
+    """Reject false positives like headers/legal words.
+
+    min_words lets a caller with a stronger trust signal than usual (e.g.
+    Method 0's own verified-National-ID-anchored record) accept a shorter
+    name than the general MIN_NAME_WORDS bar.
+    """
     if not name:
         return False
 
@@ -346,7 +415,7 @@ def is_valid_person_name(
     if any(word in INVALID_NAME_WORDS for word in words):
         return False
 
-    if len(words) < MIN_NAME_WORDS and not (has_national_id and direct_pattern_match):
+    if len(words) < min_words and not (has_national_id and direct_pattern_match):
         return False
 
     return True
@@ -377,14 +446,26 @@ def _matched_keyword(line: str) -> Optional[str]:
 
 
 def _normalize_registration_number(value: str) -> Optional[str]:
-    """Normalize company registration number like REG - 202602 -> REG-202602."""
+    """Normalize company registration number.
+
+    Supports:
+    - REG-202608
+    - REG - 202608
+    - REG 202608
+    - REG202608
+    - 123456 (numeric-only registry number)
+    """
     if not value:
         return None
 
-    value = str(value).strip()
+    value = str(value).strip().upper()
     value = re.sub(r"\s*[-–—]\s*", "-", value)
     value = re.sub(r"\s+", "", value)
-    value = value.upper()
+
+    letters_digits = re.fullmatch(r"([A-Z]{1,10})(\d{3,15})", value)
+
+    if letters_digits:
+        return f"{letters_digits.group(1)}-{letters_digits.group(2)}"
 
     if re.fullmatch(r"[A-Z]{1,10}-\d{3,15}", value):
         return value
@@ -395,21 +476,41 @@ def _normalize_registration_number(value: str) -> Optional[str]:
     return None
 
 
+_REGISTRATION_VALUE_PATTERN = r"[A-Za-z]{1,10}\s*[-–—]?\s*\d{3,15}|\d{3,15}"
+
+_REGISTRATION_LABEL_PATTERN = re.compile(
+    r"رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة", flags=re.IGNORECASE
+)
+_REGISTRATION_VALUE_SEARCH_PATTERN = re.compile(
+    r"[A-Za-z]{1,10}\s*[-–—]?\s*\d{3,15}"  # letter-prefixed, any digit length
+    r"|(?<!\d)\d{3,10}(?!\d)"              # short numeric-only registry number
+    r"|(?<!\d)\d{12,15}(?!\d)"             # long numeric-only, but not exactly
+                                            # 11 digits -- that's a National ID
+)
+
+
 def _extract_registration_number(line: str) -> Optional[str]:
     """
     Extract company registration number.
 
     Supports:
     - رقم التسجيل: 123456
-    - رقم التسجيل: REG-202602
-    - REG-202602 : رقم التسجيل
+    - رقم التسجيل: REG-202608
+    - REG-202608 : رقم التسجيل
+    - REG-202608 : شركة المسار للتقنيات المالية رقم التسجيل
+      (OCR put the company name *between* the value and its own label --
+      the label search below doesn't require them to be adjacent)
     """
     if not line:
         return None
 
     patterns = [
-        r"(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)\s*[:：]?\s*(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})",
-        r"(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})\s*[:：]?\s*(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)",
+        r"(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)\s*[:：]?\s*(?P<value>"
+        + _REGISTRATION_VALUE_PATTERN
+        + r")",
+        r"(?P<value>"
+        + _REGISTRATION_VALUE_PATTERN
+        + r")\s*[:：]?\s*(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)",
     ]
 
     for pattern in patterns:
@@ -418,23 +519,42 @@ def _extract_registration_number(line: str) -> Optional[str]:
         if match:
             return _normalize_registration_number(match.group("value"))
 
+    # Fallback: label and value both present somewhere on the line, but not
+    # immediately adjacent (OCR interposed the company name between them).
+    if _REGISTRATION_LABEL_PATTERN.search(line):
+        value_match = _REGISTRATION_VALUE_SEARCH_PATTERN.search(line)
+
+        if value_match:
+            return _normalize_registration_number(value_match.group(0))
+
     return None
 
+
 # ---------------------------------------------------------------------------
-# Method 0: Structured target list extraction
+# Method 0: Structured target list extraction (line-based logical records)
 # ---------------------------------------------------------------------------
 
-_TARGET_SECTION_KEYWORDS = [
-    "الأشخاص / الجهات المطلوبة",
-    "الاشخاص / الجهات المطلوبة",
-    "الأشخاص/ الجهات المطلوبة",
-    "الاشخاص/ الجهات المطلوبة",
-    "الأشخاص الجهات المطلوبة",
-    "الاشخاص الجهات المطلوبة",
-    "الأشخاص المطلوبة",
-    "الاشخاص المطلوبة",
-    "الجهات المطلوبة",
-    "الجهات المطلوبه",
+# Matches: "الأشخاص / الجهات المطلوبة", "الاشخاص الجهات المطلوبة",
+# "الأشخاص المطلوبة", "الجهات المطلوبة", with or without hamza and with
+# OCR spacing variations around the separator.
+_SECTION_TITLE_PATTERN = re.compile(
+    r"(?:الاشخاص|الأشخاص)\s*(?:[/|\\\-–—,،]\s*)?(?:الجهات\s*)?المطلوب[ةه]"
+    r"|"
+    r"الجهات\s*المطلوب[ةه]"
+)
+
+
+_SECTION_END_KEYWORDS = [
+    "مرفق",
+    "المرفقات",
+    "وتفضلوا",
+    "ختم",
+    "كاتب",
+    "صفحة",
+    "يرجى اعتماد",
+    "هذه الصفحة",
+    "التوقيع",
+    "رئيس المحكمة",
 ]
 
 
@@ -447,17 +567,6 @@ _RECIPIENT_OR_GREETING_PHRASES = [
     "تحية طيبة",
     "تحية طبية",
     "وبعد",
-]
-
-
-_SECTION_END_KEYWORDS = [
-    "مرفق",
-    "وتفضلوا",
-    "ختم",
-    "كاتب",
-    "صفحة",
-    "يرجى اعتماد",
-    "هذه الصفحة",
 ]
 
 
@@ -484,22 +593,23 @@ def _is_section_end(line: str) -> bool:
 
 def _get_target_section_lines(cleaned_text: str) -> List[str]:
     """
-    Return only the target persons/companies section.
+    Return only the lines belonging to the target persons/companies section.
 
-    If OCR misses the exact section title, still use the full text but stop
-    before footer/signature.
+    Structured extraction only runs when a real section title is found --
+    it must never fall back to treating the whole document as the target
+    section, since that is exactly what let unrelated text turn into
+    bogus records.
     """
     if not cleaned_text:
         return []
 
-    search_text = cleaned_text
+    match = _SECTION_TITLE_PATTERN.search(cleaned_text)
 
-    for keyword in _TARGET_SECTION_KEYWORDS:
-        if keyword in cleaned_text:
-            search_text = cleaned_text.split(keyword, 1)[1]
-            break
+    if not match:
+        return []
 
-    lines = [line.strip() for line in search_text.splitlines() if line.strip()]
+    remainder = cleaned_text[match.end():]
+    lines = [line.strip() for line in remainder.splitlines() if line.strip()]
 
     target_lines = []
 
@@ -507,14 +617,27 @@ def _get_target_section_lines(cleaned_text: str) -> List[str]:
         if _is_section_end(line):
             break
 
+        if _is_recipient_or_greeting_line(line):
+            continue
+
         target_lines.append(line)
 
     return target_lines
 
 
+# Real Arabic personal names in this document set are consistently 3+
+# characters (يوسف، سامر، فؤاد، ليث، عدي، سالم، ...) -- a bare 2-character
+# fragment showing up as its own "word" is a truncated OCR artifact (a
+# split glyph cluster like "قر"/"فر"), never a genuine name.
+_MIN_INDIVIDUAL_WORD_LENGTH = 3
+
+
 def _is_noise_word(word: str, allow_company_word: bool = False) -> bool:
-    if allow_company_word and word == "شركة":
+    if allow_company_word and word in COMPANY_NAME_KEYWORDS:
         return False
+
+    if not allow_company_word and len(word) < _MIN_INDIVIDUAL_WORD_LENGTH:
+        return True
 
     return (
         word in _STRUCTURED_LABEL_NOISE
@@ -540,7 +663,7 @@ def _extract_name_segments(
     text = text.replace("-", " ")
     text = text.replace("،", " ")
     text = NATIONAL_ID_PATTERN.sub(" ", text)
-    text = re.sub(r"[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}", " ", text)
+    text = re.sub(r"[A-Za-z]{1,10}\s*[-–—]?\s*\d{3,15}", " ", text)
     text = _normalize_spaces(text)
 
     words = _ARABIC_WORD_PATTERN.findall(text)
@@ -564,17 +687,23 @@ def _extract_name_segments(
     return segments
 
 
-def _clean_structured_person_name(raw_name: str) -> Optional[str]:
-    """Clean a person name captured from structured target-list rows."""
+def _clean_structured_person_name(raw_name: str, min_words: int = 3) -> Optional[str]:
+    """Clean a person name captured from structured target-list rows.
+
+    min_words defaults to 3 (the general "this reads like a real name"
+    bar). Method 0 callers may lower it to 2 for a record that's already
+    anchored by its own verified National ID -- the record boundary
+    itself is the trust signal there, not the word count.
+    """
     segments = _extract_name_segments(raw_name, allow_company_word=False)
 
     valid_segments = []
 
     for segment in segments:
-        if len(segment) >= 3:
+        if len(segment) >= min_words:
             name = _normalize_spaces(" ".join(segment[-6:]))
 
-            if is_valid_person_name(name, has_national_id=True):
+            if is_valid_person_name(name, has_national_id=True, min_words=min_words):
                 valid_segments.append(name)
 
     if not valid_segments:
@@ -583,30 +712,10 @@ def _clean_structured_person_name(raw_name: str) -> Optional[str]:
     return valid_segments[-1]
 
 
-def _clean_structured_company_name(raw_name: str) -> Optional[str]:
-    """Clean company name from structured target-list rows."""
-    segments = _extract_name_segments(raw_name, allow_company_word=True)
-
-    candidates = []
-
-    for segment in segments:
-        if len(segment) < 2:
-            continue
-
-        name = _normalize_spaces(" ".join(segment[-8:]))
-
-        if any(keyword in name for keyword in COMPANY_KEYWORDS):
-            candidates.append(name)
-
-    if not candidates:
-        return None
-
-    return max(candidates, key=lambda item: len(item.split()))
-
-
 def _extract_name_near_national_id(
     section_text: str,
     national_id: str,
+    min_words: int = 3,
 ) -> Optional[str]:
     """
     Extract individual name around National ID from flattened target section.
@@ -628,12 +737,12 @@ def _extract_name_near_national_id(
     after_id = section_text[id_pos + len(national_id): id_pos + len(national_id) + 180]
 
     # Usually Arabic form has name before "الرقم الوطني".
-    before_name = _clean_structured_person_name(before_id)
+    before_name = _clean_structured_person_name(before_id, min_words=min_words)
 
     if before_name:
         return before_name
 
-    after_name = _clean_structured_person_name(after_id)
+    after_name = _clean_structured_person_name(after_id, min_words=min_words)
 
     if after_name:
         return after_name
@@ -641,135 +750,505 @@ def _extract_name_near_national_id(
     return None
 
 
-def _find_registration_numbers(text: str) -> List[str]:
-    if not text:
-        return []
+# ---------------------------------------------------------------------------
+# Method 0: logical-record splitting
+# ---------------------------------------------------------------------------
 
-    patterns = [
-        r"(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)\s*[:：]?\s*(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})",
-        r"(?P<value>[A-Za-z]{1,10}\s*[-–—]\s*\d{3,15}|\d{3,15})\s*[:：]?\s*(?:رقم\s*التسجيل|سجل\s*تجاري|رقم\s*الشركة)",
+# Explicit "نوع الشخص: فرد/شركة" declaration -- only counts as an anchor
+# when it actually carries a value, an empty/truncated label is not one.
+_TYPE_DECLARATION_PATTERN = re.compile(r"نوع\s*الشخص\s*[:：\-]?\s*(فرد|شركة)")
+
+
+def _line_explicit_type(line: str) -> Optional[str]:
+    match = _TYPE_DECLARATION_PATTERN.search(line)
+
+    if not match:
+        return None
+
+    return "Company" if match.group(1) == "شركة" else "Individual"
+
+
+class _LogicalRecord:
+    """One row of the structured target list, built only from its own lines."""
+
+    __slots__ = ("national_id", "registration_number", "explicit_type", "raw_lines")
+
+    def __init__(self) -> None:
+        self.national_id: Optional[str] = None
+        self.registration_number: Optional[str] = None
+        self.explicit_type: Optional[str] = None
+        self.raw_lines: List[str] = []
+
+    def has_identifier(self) -> bool:
+        return bool(self.national_id or self.registration_number)
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.raw_lines)
+
+    def _is_anchor_line(self, line: str) -> bool:
+        return bool(
+            _first_national_id(line)
+            or _extract_registration_number(line)
+            or _line_explicit_type(line)
+        )
+
+    @property
+    def individual_text(self) -> str:
+        """Same lines as `text`, but with plain (non-anchor) name-fragment
+        lines reordered so a lone one-word line never sits ahead of a
+        multi-word line.
+
+        EasyOCR sometimes emits a short single-word row (typically a
+        family-name fragment on its own bounding box) *before* the row it
+        visually belongs after, e.g. "الخطيب" then "ليث محمود" instead of
+        "ليث محمود" then "الخطيب". Moving one-word fragment lines after
+        multi-word ones restores natural given-name -> family-name order
+        without ever reordering the words *within* a single OCR line.
+
+        When a record has *no* multi-word line at all -- every name word
+        landed on its own separate single-word line -- there's no anchor
+        to move fragments after, but the same left-to-right/right-to-left
+        sorting artifact still applies directly: two consecutive
+        single-word boxes on one physical row get listed in reverse
+        reading order (e.g. "حمد" then "وائل" instead of "وائل" then
+        "حمد"). Reversing the whole single-word group in that case
+        restores correct order; it's a no-op for the too-short (<3 char)
+        fragments among them since those get filtered out as noise
+        wherever they land.
+        """
+        anchor_lines = []
+        plain_lines = []
+
+        for line in self.raw_lines:
+            if self._is_anchor_line(line):
+                anchor_lines.append(line)
+            else:
+                plain_lines.append(line)
+
+        multi_word_lines = [
+            line for line in plain_lines
+            if len(_ARABIC_WORD_PATTERN.findall(line)) >= 2
+        ]
+        single_word_lines = [
+            line for line in plain_lines
+            if len(_ARABIC_WORD_PATTERN.findall(line)) == 1
+        ]
+        other_lines = [
+            line for line in plain_lines
+            if line not in multi_word_lines and line not in single_word_lines
+        ]
+
+        if not multi_word_lines and len(single_word_lines) >= 2:
+            single_word_lines = list(reversed(single_word_lines))
+
+        return " ".join(anchor_lines + multi_word_lines + single_word_lines + other_lines)
+
+    @property
+    def has_isolated_family_fragment(self) -> bool:
+        """
+        True when this record's own lines already confirm which captured
+        word is the family name -- i.e. OCR split the row into a lone
+        single-word line *and* a separate multi-word line (the case
+        `individual_text` reorders). That confirms the single word is the
+        trailing family name and any still-missing word is an *interior*
+        gap (the grandfather slot, right before it).
+
+        False when the record's own lines merged straight into one
+        contiguous multi-word capture with no isolated single-word
+        fragment -- here a missing word is a *leading* gap (the record
+        was cut off at its start, most commonly dropping the given name),
+        so it belongs at the front instead.
+        """
+        anchor_lines = []
+        plain_lines = []
+
+        for line in self.raw_lines:
+            if self._is_anchor_line(line):
+                anchor_lines.append(line)
+            else:
+                plain_lines.append(line)
+
+        has_single = any(len(_ARABIC_WORD_PATTERN.findall(line)) == 1 for line in plain_lines)
+        has_multi = any(len(_ARABIC_WORD_PATTERN.findall(line)) >= 2 for line in plain_lines)
+
+        return has_single and has_multi
+
+    @property
+    def has_multi_word_line(self) -> bool:
+        """
+        True when at least one of this record's own plain lines held 2+
+        words together (e.g. "فؤاد العزام"). A multi-word line is a
+        single OCR detection, so it reliably preserves true reading order
+        -- a captured 2-word pair built *from one* is trustworthy enough
+        to safely assume it's the trailing (grandfather+family) pair.
+
+        False when every plain line held exactly one word each: two
+        separate single-word boxes carry no guarantee about which slots
+        they fill (leading, trailing, or interior) -- see
+        _recover_orphan_first_names' "unconfirmed pair" handling.
+        """
+        return any(
+            len(_ARABIC_WORD_PATTERN.findall(line)) >= 2
+            for line in self.raw_lines
+            if not self._is_anchor_line(line)
+        )
+
+    @property
+    def short_fragment_candidates(self) -> List[str]:
+        """
+        Standalone 2-character plain-line fragments -- too short to trust
+        as a name on their own (see _MIN_INDIVIDUAL_WORD_LENGTH), but
+        exactly the shape of one half of a word EasyOCR split across two
+        bounding boxes (e.g. "قراس" -> "قر" left in this record, "راس"
+        landing separately in the footer as an orphan token). Kept, in
+        order, purely as raw material for _stitch_recovered_token to try
+        recombining with an orphan token -- never used as a name on their
+        own.
+        """
+        fragments = []
+
+        for line in self.raw_lines:
+            if self._is_anchor_line(line):
+                continue
+
+            words = _ARABIC_WORD_PATTERN.findall(line)
+
+            if len(words) == 1 and len(words[0]) == 2:
+                fragments.append(words[0])
+
+        return fragments
+
+
+def _split_into_logical_records(target_lines: List[str]) -> List[_LogicalRecord]:
+    """
+    Group target-section lines into logical records.
+
+    A new record starts at an identifier line (national ID or registration
+    number) once the current record already has an identifier of its own --
+    that is the "close the previous record" rule. A bare explicit-type
+    declaration ("نوع الشخص: شركة") with no identifier yet does not close
+    anything by itself; it just marks the type of whatever record is being
+    built, so a registration number arriving on the very next physical line
+    (an OCR row split into two lines) still lands in the same record.
+    """
+    records: List[_LogicalRecord] = []
+    current: Optional[_LogicalRecord] = None
+
+    for line in target_lines:
+        national_id = _first_national_id(line)
+        registration_number = _extract_registration_number(line)
+        explicit_type = _line_explicit_type(line)
+        is_anchor = bool(national_id or registration_number or explicit_type)
+
+        if is_anchor:
+            if current is not None and current.has_identifier():
+                records.append(current)
+                current = _LogicalRecord()
+            elif current is None:
+                current = _LogicalRecord()
+
+            if national_id and not current.national_id:
+                current.national_id = national_id
+
+            if registration_number and not current.registration_number:
+                current.registration_number = registration_number
+
+            if explicit_type and not current.explicit_type:
+                current.explicit_type = explicit_type
+
+            current.raw_lines.append(line)
+        else:
+            if current is None:
+                current = _LogicalRecord()
+
+            current.raw_lines.append(line)
+
+    if current is not None:
+        records.append(current)
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Method 0: company name reconstruction
+# ---------------------------------------------------------------------------
+
+def _build_company_name_from_record(record: _LogicalRecord) -> Optional[str]:
+    """
+    Build a company name from a logical record's own lines only.
+
+    Handles OCR damage seen in practice:
+    - the company keyword ("شركة") ends up trailing the rest of the name
+      instead of leading it (OCR line-order artifact) -> reordered to the
+      front.
+    - the company keyword never got OCR'd into the name text at all
+      (it only appeared in the "نوع الشخص: شركة" declaration) -> the
+      keyword is still prefixed so the name never starts mid-phrase.
+    """
+    segments = _extract_name_segments(record.text, allow_company_word=True)
+    segments = [
+        segment for segment in segments
+        if len(segment) >= 2 or segment[0] in COMPANY_NAME_KEYWORDS
     ]
+    words: List[str] = [word for segment in segments for word in segment]
+    words = _dedupe_repeated_company_keyword(words)
 
-    values = []
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            value = _normalize_registration_number(match.group("value"))
-
-            if value and value not in values:
-                values.append(value)
-
-    return values
-
-
-def _extract_company_name_near_registration(
-    section_text: str,
-    registration_number: str,
-) -> Optional[str]:
-    """
-    Extract company name around registration number.
-
-    Example:
-    شركة النجمة للحلول التقنية | رقم التسجيل: REG-202602 | نوع الشخص: شركة
-    """
-    if not section_text or not registration_number:
+    if not words:
         return None
 
-    reg_pos = section_text.find(registration_number)
+    name = _ensure_company_keyword_prefix(_normalize_spaces(" ".join(words)))
 
-    if reg_pos == -1:
-        return None
-
-    before_reg = section_text[max(0, reg_pos - 220):reg_pos]
-    after_reg = section_text[reg_pos + len(registration_number): reg_pos + len(registration_number) + 120]
-
-    before_company = _clean_structured_company_name(before_reg)
-
-    if before_company:
-        return before_company
-
-    after_company = _clean_structured_company_name(after_reg)
-
-    if after_company:
-        return after_company
-
-    return None
+    return name or None
 
 
-def _extract_structured_list_records(cleaned_text: str) -> List[PersonRecord]:
+def _dedupe_repeated_company_keyword(words: List[str]) -> List[str]:
+    """OCR sometimes detects the company keyword twice for one row (once
+    from a "نوع الشخص: شركة" declaration, once as part of the name itself).
+    Keep only the first occurrence -- a company name should carry its
+    keyword exactly once."""
+    seen_keyword = False
+    deduped = []
+
+    for word in words:
+        if word in COMPANY_NAME_KEYWORDS:
+            if seen_keyword:
+                continue
+            seen_keyword = True
+
+        deduped.append(word)
+
+    return deduped
+
+
+def _ensure_company_keyword_prefix(name: str) -> str:
+    """Make sure a company name starts with its own keyword, in order.
+
+    Never reverses the rest of the name -- only relocates (or, if missing
+    entirely, prepends) the single company keyword word.
+    """
+    words = name.split()
+
+    if not words:
+        return name
+
+    for keyword in COMPANY_NAME_KEYWORDS:
+        if keyword in words:
+            if words[0] != keyword:
+                words.remove(keyword)
+                words.insert(0, keyword)
+            return _normalize_spaces(" ".join(words))
+
+    # No company keyword survived in the name text at all -- the record is
+    # only known to be a company because of its registration number / type
+    # declaration, so prefix the generic keyword rather than emit a name
+    # that doesn't read as a company.
+    return _normalize_spaces("شركة " + name)
+
+
+def _company_missing_brand_word(name: Optional[str]) -> bool:
+    """
+    True when a company name looks like "شركة للخدمات المالية" -- the
+    keyword and the service-type phrase are both present and in order,
+    but the brand word that normally sits between them was dropped by OCR.
+    """
+    if not name:
+        return False
+
+    words = name.split()
+
+    if len(words) < 2 or words[0] not in COMPANY_NAME_KEYWORDS:
+        return False
+
+    return bool(re.match(r"^ل[؀-ۿ]", words[1]))
+
+
+# ---------------------------------------------------------------------------
+# Method 0: person type + confidence
+# ---------------------------------------------------------------------------
+
+def _determine_person_type(record: _LogicalRecord, name: Optional[str]) -> str:
+    """
+    Priority (evaluated only against this same logical record):
+    1. registration_number exists -> Company
+    2. explicit "نوع الشخص: شركة" -> Company
+    3. national_id exists -> Individual
+    4. explicit "نوع الشخص: فرد" -> Individual
+    5. company keyword in the name -> Company
+    6. otherwise -> Individual (caller marks needs_review)
+    """
+    if record.registration_number:
+        return "Company"
+
+    if record.explicit_type == "Company":
+        return "Company"
+
+    if record.national_id:
+        return "Individual"
+
+    if record.explicit_type == "Individual":
+        return "Individual"
+
+    if name and is_company_line(name):
+        return "Company"
+
+    return "Individual"
+
+
+def _build_structured_record_from_logical(
+    record: _LogicalRecord,
+) -> Tuple[Optional[PersonRecord], List[str]]:
+    """Returns (record_or_none, short_fragment_candidates) -- the latter is
+    only ever non-empty for an Individual record, and is raw material for
+    later orphan-token stitching, never used to build full_name here."""
+    person_type = _determine_person_type(record, None)
+
+    if person_type == "Company":
+        full_name = _build_company_name_from_record(record)
+
+        if not full_name or not record.registration_number:
+            # A company without a registration number and without a
+            # reconstructable name is not a usable structured record --
+            # let the other extraction methods have a chance instead of
+            # emitting a guess.
+            if not full_name:
+                return None, []
+
+        return _make_person_record(
+            full_name=full_name,
+            national_id=None,
+            registration_number=record.registration_number,
+            person_type="Company",
+            confidence=EXACT_MATCH_CONFIDENCE + 0.05,
+            needs_review=False,
+            source="rules",
+            extraction_method="structured_target_list",
+        ), []
+
+    # Individual.
+    individual_text = record.individual_text
+    capture_tier = "strict"
+
+    if record.national_id:
+        full_name = _extract_name_near_national_id(individual_text, record.national_id)
+
+        if not full_name:
+            # Fall back to a 2-word capture -- the record is still trusted
+            # because it's anchored by its own verified National ID; a
+            # missing given/father name is recovered later from the
+            # orphan-token pool, not guessed here.
+            full_name = _extract_name_near_national_id(
+                individual_text, record.national_id, min_words=2
+            )
+            capture_tier = "relaxed"
+
+        if not full_name:
+            # Last resort: even a single genuine word anchored by a
+            # verified National ID is worth surfacing rather than silently
+            # dropping the record. Recovery still gets attempted for this
+            # tier (see _recover_orphan_first_names), but only ever lands
+            # on a confident result when the orphan pool cleanly supplies
+            # the rest -- otherwise it stays flagged for review.
+            full_name = _extract_name_near_national_id(
+                individual_text, record.national_id, min_words=1
+            )
+            capture_tier = "sparse"
+    else:
+        full_name = _clean_structured_person_name(individual_text)
+
+    if not full_name:
+        return None, []
+
+    if not record.national_id and record.explicit_type != "Individual":
+        # No identifier and no explicit type declaration -- not a valid
+        # structured record on its own.
+        return None, []
+
+    if capture_tier == "sparse":
+        confidence, needs_review = 0.60, True
+    elif capture_tier == "relaxed":
+        confidence, needs_review = 0.75, True
+    else:
+        confidence, needs_review = EXACT_MATCH_CONFIDENCE + 0.05, False
+
+    # A still-incomplete name (< 4 words) may get one more word filled in
+    # later by orphan-token recovery. Whether that recovered word belongs
+    # at the front or in the interior (just before the family name)
+    # depends on how *this* record's own lines were shaped -- tag it now
+    # while we still have that structural information, since orphan
+    # recovery only ever sees the flat PersonRecord afterwards.
+    extraction_method = "structured_target_list"
+
+    if len(full_name.split()) < _FULL_NAME_WORD_COUNT and record.has_isolated_family_fragment:
+        extraction_method = "structured_target_list_reordered"
+    elif capture_tier == "relaxed" and not record.has_multi_word_line:
+        # A 2-word capture built from two *separate* single-word lines
+        # (not one multi-word line) carries no guarantee it's the
+        # trailing pair -- it could just as easily be an interior pair
+        # with gaps on both sides. Confidently prepending both recovered
+        # words assumes the former; when it's actually the latter, that
+        # produces a confident wrong name instead of a merely incomplete
+        # one. Tag it so recovery treats this pair as unconfirmed and
+        # leaves it as its honest partial capture rather than guessing.
+        extraction_method = "structured_target_list_unconfirmed_pair"
+
+    person_record = _make_person_record(
+        full_name=full_name,
+        national_id=record.national_id,
+        registration_number=None,
+        person_type="Individual",
+        confidence=confidence,
+        needs_review=needs_review,
+        source="rules",
+        extraction_method=extraction_method,
+    )
+
+    return person_record, record.short_fragment_candidates
+
+
+def _extract_structured_list_records(
+    cleaned_text: str,
+) -> Tuple[List[PersonRecord], Dict[str, List[str]]]:
     """
     Extract target rows from:
     الأشخاص / الجهات المطلوبة:
     - name | الرقم الوطني: id | نوع الشخص: فرد
-    - company name | رقم التسجيل: REG-202602 | نوع الشخص: شركة
+    - company name | رقم التسجيل: REG-202608 | نوع الشخص: شركة
+
+    Each row is parsed as its own logical record (its own lines only) so a
+    name, identifier, or type keyword from one row can never bleed into
+    another row's record.
+
+    Returns (records, stitch_hints) -- stitch_hints maps a still-incomplete
+    Individual record's own National ID to its record's short (2-char)
+    leftover fragments, for _recover_orphan_first_names to try recombining
+    with an orphan token later.
     """
     if not cleaned_text:
-        return []
-
-    records: List[PersonRecord] = []
+        return [], {}
 
     target_lines = _get_target_section_lines(cleaned_text)
-    section_text = _normalize_spaces(" ".join(target_lines))
 
-    if not section_text:
-        return []
+    if not target_lines:
+        return [], {}
 
-    # ------------------------------------------------------------
-    # Individuals: National ID-based extraction.
-    # ------------------------------------------------------------
-    national_ids = []
+    logical_records = _split_into_logical_records(target_lines)
 
-    for national_id in find_national_ids(section_text):
-        if national_id not in national_ids:
-            national_ids.append(national_id)
+    records: List[PersonRecord] = []
+    stitch_hints: Dict[str, List[str]] = {}
 
-    for national_id in national_ids:
-        full_name = _extract_name_near_national_id(section_text, national_id)
+    for logical_record in logical_records:
+        record, short_fragments = _build_structured_record_from_logical(logical_record)
 
-        if not full_name:
-            continue
+        if record:
+            records.append(record)
 
-        records.append(
-            _make_person_record(
-                full_name=full_name,
-                national_id=national_id,
-                registration_number=None,
-                person_type="Individual",
-                confidence=0.90,
-                needs_review=False,
-                source="rules",
-                extraction_method="structured_target_list",
-            )
-        )
+            if record.national_id and short_fragments:
+                stitch_hints[record.national_id] = short_fragments
 
-    # ------------------------------------------------------------
-    # Companies: Registration Number-based extraction.
-    # ------------------------------------------------------------
-    registration_numbers = _find_registration_numbers(section_text)
+    return _deduplicate_records(records), stitch_hints
 
-    for registration_number in registration_numbers:
-        company_name = _extract_company_name_near_registration(
-            section_text,
-            registration_number,
-        )
 
-        if not company_name:
-            continue
-
-        records.append(
-            _make_person_record(
-                full_name=company_name,
-                national_id=None,
-                registration_number=registration_number,
-                person_type="Company",
-                confidence=0.90,
-                needs_review=False,
-                source="rules",
-                extraction_method="structured_target_list",
-            )
-        )
-
-    return _deduplicate_records(records)
 # ---------------------------------------------------------------------------
 # Method 1: Direct legal phrase + name + National ID
 # ---------------------------------------------------------------------------
@@ -1148,31 +1627,21 @@ def _extract_emergency_national_id_records(
 
 
 # ---------------------------------------------------------------------------
-# OCR orphan first-name recovery
+# OCR orphan token recovery
 # ---------------------------------------------------------------------------
+# EasyOCR sometimes detects one visual row's leading word as a separate
+# bounding box that ends up sorted far away from its row -- typically down
+# in the footer/signature area. This recovers exactly that single word and
+# reattaches it to the record it visually belongs to, never invents a word
+# that isn't present verbatim in the OCR text, and never touches a record
+# that already looks complete.
 
-_COMMON_FIRST_NAMES = {
-    "عمر",
-    "محمد",
-    "احمد",
-    "أحمد",
-    "خالد",
-    "نور",
-    "هدى",
-    "هدا",
-    "ابراهيم",
-    "إبراهيم",
-    "سامي",
-    "ناصر",
-    "مازن",
-    "محمود",
-    "عبدالله",
-    "عبد",
-    "سارة",
-    "رنا",
-}
-
-
+# Generic words/labels that can show up as a lone stray OCR line but are
+# never themselves a name fragment -- section labels, footer/signature
+# boilerplate, and document furniture. Eligibility for the orphan pool is
+# a deny-list (not an allow-list of "known first names"): Jordanian given
+# names can't be enumerated in advance, but the generic document
+# vocabulary that leaks onto its own line can.
 _ORPHAN_NOISE_WORDS = {
     "الرقم",
     "الوطني",
@@ -1190,26 +1659,78 @@ _ORPHAN_NOISE_WORDS = {
     "على",
     "اللازمة",
     "وتزويدنا",
+    "لديكم",
     "افي",
     "في",
+    "الأردنية",
+    "الاردنية",
+    "عمان",
+    "التوقيع",
+    "كتاب",
+    "الأصول",
+    "الاصول",
+    "حول",
+    "بقبول",
+    "الاحترام",
+    "الاحتر",
+    "قرار",
+    "يرجى",
+    "اتخاذ",
+    "حسب",
 }
 
 
-def _extract_orphan_first_names(cleaned_text: str) -> List[str]:
+def _is_eligible_orphan_token(word: str) -> bool:
+    if len(word) < _MIN_INDIVIDUAL_WORD_LENGTH:
+        return False
+
+    return not (
+        word in _STRUCTURED_LABEL_NOISE
+        or word in INVALID_NAME_WORDS
+        or word in _NAME_NOISE_WORDS
+        or word in _ORPHAN_NOISE_WORDS
+        or word in COMPANY_NAME_KEYWORDS
+    )
+
+
+def _get_lines_after_section_end(cleaned_text: str) -> List[str]:
+    """
+    Lines strictly *after* the structured section's footer boundary --
+    exactly the part `_get_target_section_lines` excludes. This is where
+    EasyOCR's stray single-word fragments (scattered given names, brand
+    words) actually land in both documents this system has seen so far.
+
+    Restricting the scan to here (instead of rescanning from the section
+    title onward) means a word that's already inside some record's own
+    lines can never be double-counted as an "orphan" too.
+    """
     if not cleaned_text:
         return []
 
-    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
-    candidates: List[str] = []
+    match = _SECTION_TITLE_PATTERN.search(cleaned_text)
 
-    start_index = 0
+    if not match:
+        return []
+
+    remainder = cleaned_text[match.end():]
+    lines = [line.strip() for line in remainder.splitlines() if line.strip()]
 
     for i, line in enumerate(lines):
-        if "الأشخاص" in line or "الاشخاص" in line or "الجهات المطلوبة" in line:
-            start_index = i
-            break
+        if _is_section_end(line):
+            return lines[i:]
 
-    for line in lines[start_index:]:
+    return []
+
+
+def _extract_orphan_single_words(cleaned_text: str) -> List[str]:
+    """
+    Standalone single-Arabic-word lines from past the section's footer
+    boundary, in document order. These are the candidate pool for orphan
+    recovery.
+    """
+    candidates: List[str] = []
+
+    for line in _get_lines_after_section_end(cleaned_text):
         words = _ARABIC_WORD_PATTERN.findall(line)
 
         if len(words) != 1:
@@ -1217,68 +1738,247 @@ def _extract_orphan_first_names(cleaned_text: str) -> List[str]:
 
         word = _fix_ocr_name_word(words[0])
 
-        if word in _ORPHAN_NOISE_WORDS:
+        if not _is_eligible_orphan_token(word):
             continue
 
-        if word in _COMMON_FIRST_NAMES:
-            candidates.append(word)
+        candidates.append(word)
 
-    unique = []
+    return candidates
 
-    for word in candidates:
-        if word not in unique:
-            unique.append(word)
 
-    return unique
+_RECOVERABLE_INDIVIDUAL_METHODS = {
+    "structured_target_list",
+    "structured_target_list_reordered",
+    "structured_target_list_unconfirmed_pair",
+    "national_id_context",
+    "emergency_national_id_context",
+}
+
+# Arrangement is never confidently applied for this tag (see
+# _build_structured_record_from_logical) -- it still consumes its share
+# of the orphan pool to keep alignment correct for later records, but
+# always leaves the record as its own honest partial capture.
+_UNCONFIRMED_PAIR_METHOD = "structured_target_list_unconfirmed_pair"
+
+# Target shape for a full Arabic legal name: [given, father, grandfather,
+# family]. The family name is always last (individual records are already
+# reordered so a lone family-name fragment sits at the end -- see
+# _LogicalRecord.individual_text), so however many words are still
+# missing are the *leading* slots.
+_FULL_NAME_WORD_COUNT = 4
+
+
+def _pop_orphan_tokens(orphan_pool: List[str], count: int) -> Optional[List[str]]:
+    """Pop the next `count` eligible tokens from the pool, in order.
+    Returns None (and leaves the pool untouched) if there aren't enough."""
+    indices = []
+
+    for i, token in enumerate(orphan_pool):
+        if len(indices) == count:
+            break
+
+        indices.append(i)
+
+    if len(indices) < count:
+        return None
+
+    tokens = [orphan_pool[i] for i in indices]
+
+    for i in reversed(indices):
+        orphan_pool.pop(i)
+
+    return tokens
+
+
+# Above this many missing words, a *plain* prepend/interior-insert stops
+# being a safe default -- see _recover_orphan_first_names. Missing==3 is
+# still attempted, but only with the more specific "single interior word"
+# arrangement below, and always landing at a slightly lower confidence.
+_MAX_SAFE_RECOVERY_GAP = 2
+_MAX_RECOVERY_GAP = 3
+
+
+def _stitch_recovered_tokens(tokens: List[str], fragments: List[str]) -> List[str]:
+    """
+    Try to extend each recovered orphan token using one of this record's
+    own leftover 2-character fragments (see
+    _LogicalRecord.short_fragment_candidates) -- e.g. record fragment
+    "قر" + orphan token "راس" -> "قراس". Only merges when the fragment's
+    last character equals the token's first character, which is exactly
+    the shape produced when EasyOCR splits one cursive-joined word across
+    two bounding boxes and both boxes pick up the shared connecting
+    letter. Never invents a character neither piece already has, and
+    each fragment is used for at most one token.
+    """
+    if not fragments:
+        return tokens
+
+    available = list(fragments)
+    stitched = []
+
+    for token in tokens:
+        match_index = next(
+            (i for i, fragment in enumerate(available) if fragment[-1] == token[0]),
+            None,
+        )
+
+        if match_index is not None:
+            fragment = available.pop(match_index)
+            stitched.append(fragment + token[1:])
+        else:
+            stitched.append(token)
+
+    return stitched
 
 
 def _recover_orphan_first_names(
     records: List[PersonRecord],
-    cleaned_text: str,
+    orphan_pool: List[str],
+    stitch_hints: Dict[str, List[str]],
 ) -> List[PersonRecord]:
-    orphan_first_names = _extract_orphan_first_names(cleaned_text)
+    """Fill in a missing name slot for an otherwise-anchored Individual
+    record -- never touches Company records, never runs on an
+    already-complete 4-word name.
 
-    if not orphan_first_names:
-        return records
-
+    - Missing exactly 1 word: could be the *interior* grandfather slot
+      (when the record's own lines already confirmed a lone family-name
+      fragment, tagged "structured_target_list_reordered" -- the recovered
+      word slots in right before the family name) or a *leading* slot cut
+      off the front of a single contiguous capture (the far more common
+      case -- the recovered word is prepended).
+    - Missing 2 words: the record only kept the trailing pair (e.g.
+      grandfather+family); EasyOCR emits same-row RTL word fragments in
+      left-to-right (i.e. reversed) order, so the recovered group is
+      reversed back to correct reading order before being prepended.
+    - Missing 3 words (only one word of its own survived, and that word's
+      position within the name is otherwise unknown): reversing the 3
+      recovered tokens gives [given, father, family] in correct reading
+      order; the one surviving word is inserted between father and
+      family (the grandfather slot) -- the same interior position a
+      lone surviving word would occupy in the missing==1 case. This is a
+      best-effort arrangement (lower confidence than the missing<=2
+      cases), since -- unlike missing<=2 -- there's no direct structural
+      confirmation that the surviving word truly sits there.
+    - Beyond that, the record is left as its own honest (already
+      needs_review) partial capture -- but the tokens it *would* have
+      needed are still popped from the pool and discarded rather than
+      left in place. The pool is a flat, whole-document scan, not grouped
+      per record; if a record doesn't consume its share, the next record
+      in line would wrongly inherit tokens that were actually this one's,
+      shifting every downstream recovery by one.
+    """
     updated_records: List[PersonRecord] = []
-    orphan_index = 0
 
     for record in records:
         full_name = record.full_name or ""
         words = full_name.split()
+        missing = _FULL_NAME_WORD_COUNT - len(words)
+        extraction_method = getattr(record, "extraction_method", None)
 
         should_try_recovery = (
             record.person_type == "Individual"
             and bool(record.national_id)
-            and len(words) == 3
-            and getattr(record, "extraction_method", None) in {
-                "structured_target_list",
-                "national_id_context",
-                "emergency_national_id_context",
-            }
+            and missing >= 1
+            and extraction_method in _RECOVERABLE_INDIVIDUAL_METHODS
         )
 
-        if should_try_recovery and orphan_index < len(orphan_first_names):
-            first_name = orphan_first_names[orphan_index]
+        if should_try_recovery:
+            recovered = _pop_orphan_tokens(orphan_pool, missing)
 
-            if first_name not in words:
-                new_name = _normalize_spaces(f"{first_name} {full_name}")
+            if (
+                recovered
+                and missing <= _MAX_RECOVERY_GAP
+                and extraction_method != _UNCONFIRMED_PAIR_METHOD
+                and not any(token in words for token in recovered)
+            ):
+                fragments = stitch_hints.get(record.national_id, [])
+                confidence = 0.90
+
+                if missing == 1 and extraction_method == "structured_target_list_reordered":
+                    recovered = _stitch_recovered_tokens(recovered, fragments)
+                    new_words = words[:-1] + recovered + words[-1:]
+                elif missing == 1:
+                    recovered = _stitch_recovered_tokens(recovered, fragments)
+                    new_words = recovered + words
+                elif missing == 2:
+                    ordered = _stitch_recovered_tokens(list(reversed(recovered)), fragments)
+                    new_words = ordered + words
+                else:
+                    # missing == 3: [given, father, <surviving word>, family]
+                    ordered = _stitch_recovered_tokens(list(reversed(recovered)), fragments)
+                    new_words = [ordered[0], ordered[1]] + words + [ordered[2]]
+                    confidence = 0.80
 
                 record = _copy_record_with_updates(
                     record,
-                    full_name=new_name,
-                    confidence=0.85,
-                    needs_review=True,
+                    full_name=_normalize_spaces(" ".join(new_words)),
+                    confidence=confidence,
+                    needs_review=False,
                     source=record.source,
                     extraction_method="orphan_first_name_recovered",
                 )
-
-                orphan_index += 1
+            # else: tokens were consumed above (or unavailable) to keep the
+            # pool aligned for later records, but not trusted enough to
+            # apply -- the record keeps its own honest partial capture.
 
         updated_records.append(record)
 
     return updated_records
+
+
+def _recover_orphan_company_brand_words(
+    records: List[PersonRecord],
+    orphan_pool: List[str],
+) -> List[PersonRecord]:
+    """Insert a missing brand word into an otherwise-complete Company
+    record (e.g. "شركة للخدمات المالية" -> "شركة الأفق للخدمات المالية").
+
+    Never runs on Individual records, never invents a word not already
+    present verbatim as a standalone OCR line, and is skipped entirely if
+    the company name does not show the "keyword + missing brand" shape.
+    """
+    updated_records: List[PersonRecord] = []
+
+    for record in records:
+        if (
+            record.person_type == "Company"
+            and getattr(record, "extraction_method", None) == "structured_target_list"
+            and _company_missing_brand_word(record.full_name)
+        ):
+            recovered = _pop_orphan_tokens(orphan_pool, 1)
+
+            if recovered:
+                brand_word = recovered[0]
+                words = record.full_name.split()
+                new_name = _normalize_spaces(" ".join([words[0], brand_word] + words[1:]))
+
+                record = _copy_record_with_updates(
+                    record,
+                    full_name=new_name,
+                    confidence=0.90,
+                    needs_review=False,
+                    extraction_method="orphan_company_brand_recovered",
+                )
+
+        updated_records.append(record)
+
+    return updated_records
+
+
+def _recover_orphan_tokens(
+    records: List[PersonRecord],
+    cleaned_text: str,
+    stitch_hints: Dict[str, List[str]],
+) -> List[PersonRecord]:
+    orphan_pool = _extract_orphan_single_words(cleaned_text)
+
+    if not orphan_pool:
+        return records
+
+    records = _recover_orphan_first_names(records, orphan_pool, stitch_hints)
+    records = _recover_orphan_company_brand_words(records, orphan_pool)
+
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -1372,7 +2072,7 @@ def extract_person_candidates(cleaned_text: str) -> List[PersonRecord]:
     records: List[PersonRecord] = []
 
     # Method 0: structured target list rows.
-    structured_records = _extract_structured_list_records(cleaned_text)
+    structured_records, stitch_hints = _extract_structured_list_records(cleaned_text)
     records.extend(structured_records)
 
     structured_ids = {
@@ -1435,6 +2135,6 @@ def extract_person_candidates(cleaned_text: str) -> List[PersonRecord]:
     records.extend(emergency_records)
 
     final_records = _deduplicate_records(records)
-    final_records = _recover_orphan_first_names(final_records, cleaned_text)
+    final_records = _recover_orphan_tokens(final_records, cleaned_text, stitch_hints)
 
     return _deduplicate_records(final_records)

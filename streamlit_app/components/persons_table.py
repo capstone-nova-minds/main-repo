@@ -8,6 +8,15 @@ PERSON_COLUMNS = [
     "person_type", "confidence", "needs_review", "source",
 ]
 
+# Carried through the editor but never shown to the reviewer. record_index
+# is the stable reference back to this row's original automatic record
+# (stamped by api/process.py) -- evaluation_service.calculate_field_accuracy
+# uses it to compare the right pair of records even after the reviewer
+# edits full_name, national_id, or registration_number.
+HIDDEN_COLUMNS = ["record_index"]
+
+ALL_COLUMNS = PERSON_COLUMNS + HIDDEN_COLUMNS
+
 
 def render_persons_table(persons: list) -> list:
     """Render an editable persons table, return the edited list of dicts."""
@@ -18,10 +27,10 @@ def render_persons_table(persons: list) -> list:
         }]
 
     df = pd.DataFrame(persons)
-    for col in PERSON_COLUMNS:
+    for col in ALL_COLUMNS:
         if col not in df.columns:
             df[col] = None
-    df = df[PERSON_COLUMNS]
+    df = df[ALL_COLUMNS]
 
     review_count = int(df["needs_review"].fillna(False).sum())
     if review_count:
@@ -35,6 +44,7 @@ def render_persons_table(persons: list) -> list:
         df,
         num_rows="dynamic",
         use_container_width=True,
+        column_order=PERSON_COLUMNS,  # record_index stays out of the UI
         column_config={
             "person_type": st.column_config.SelectboxColumn(options=["Individual", "Company"]),
             "confidence": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05),
@@ -43,4 +53,16 @@ def render_persons_table(persons: list) -> list:
         key="persons_editor",
     )
 
-    return edited_df.to_dict(orient="records")
+    # A newly added row (num_rows="dynamic") has no record_index -- pandas
+    # fills it (and any other blank cell) with NaN, which isn't valid JSON.
+    # Converting to None also makes a missing record_index unambiguous:
+    # this row has no corresponding original automatic record.
+    edited_df = edited_df.where(pd.notnull(edited_df), None)
+    records = edited_df.to_dict(orient="records")
+
+    for record in records:
+        record_index = record.get("record_index")
+        if record_index is not None:
+            record["record_index"] = int(record_index)
+
+    return records

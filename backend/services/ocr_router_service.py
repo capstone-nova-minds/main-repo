@@ -64,52 +64,123 @@ def _run_engine_attempt(engine, image_path: str) -> Dict[str, Any]:
         }
 
 
-def run_ocr_on_page(page_number: int, image_path: Path) -> Dict[str, Any]:
-    """Run the OCR router on a single page image and return the page result."""
+def run_ocr_on_page(
+    page_number: int,
+    image_path: Path,
+) -> Dict[str, Any]:
+    """Run PaddleOCR first, then EasyOCR, then Tesseract."""
+
     attempts: List[Dict[str, Any]] = []
 
-    easyocr_attempt = _run_engine_attempt(_easyocr_engine, str(image_path))
-    attempts.append(easyocr_attempt)
+    engines = [
+        _paddleocr_engine,
+        _easyocr_engine,
+        _tesseract_engine,
+    ]
 
-    best_attempt = easyocr_attempt
-    needs_fallback = (
-        easyocr_attempt["status"] != "success"
-        or easyocr_attempt["quality_score"] < QUALITY_THRESHOLD
-    )
+    best_attempt: Dict[str, Any] | None = None
+    selected_index: int | None = None
 
-    if needs_fallback:
-        tesseract_attempt = _run_engine_attempt(_tesseract_engine, str(image_path))
-        attempts.append(tesseract_attempt)
+    for index, engine in enumerate(engines):
+        attempt = _run_engine_attempt(
+            engine,
+            str(image_path),
+        )
 
-        if tesseract_attempt["quality_score"] > best_attempt["quality_score"]:
-            best_attempt = tesseract_attempt
-    else:
-        attempts.append({
-            "engine": _tesseract_engine.engine_name,
-            "status": "skipped",
+        attempts.append(attempt)
+
+        if best_attempt is None:
+            best_attempt = attempt
+        else:
+            best_success = best_attempt["status"] == "success"
+            current_success = attempt["status"] == "success"
+
+            if current_success and not best_success:
+                best_attempt = attempt
+
+            elif current_success == best_success:
+                if (
+                    attempt["quality_score"]
+                    > best_attempt["quality_score"]
+                ):
+                    best_attempt = attempt
+
+                elif (
+                    attempt["quality_score"]
+                    == best_attempt["quality_score"]
+                    and attempt["average_confidence"]
+                    > best_attempt["average_confidence"]
+                ):
+                    best_attempt = attempt
+
+        if (
+            attempt["status"] == "success"
+            and attempt["quality_score"] >= QUALITY_THRESHOLD
+        ):
+            selected_index = index
+            break
+
+    # Add skipped summaries for engines that were not needed.
+    if selected_index is not None:
+        for engine in engines[selected_index + 1:]:
+            attempts.append({
+                "engine": engine.engine_name,
+                "status": "skipped",
+                "average_confidence": 0.0,
+                "quality_score": 0.0,
+                "text_length": 0,
+                "error": None,
+                "text": "",
+            })
+
+    if best_attempt is None:
+        best_attempt = {
+            "engine": None,
+            "status": "failed",
             "average_confidence": 0.0,
             "quality_score": 0.0,
             "text_length": 0,
-            "error": None,
-        })
+            "error": "No OCR engine was executed",
+            "text": "",
+        }
 
-    page_status = "success" if best_attempt["status"] == "success" else "failed"
+    page_status = (
+        "success"
+        if best_attempt["status"] == "success"
+        and bool(best_attempt.get("text", "").strip())
+        else "failed"
+    )
 
-    # Strip the raw "text" key out of attempt summaries (kept only on the
-    # winning result at the page level) to match the documented OCR schema.
     attempt_summaries = [
-        {k: v for k, v in a.items() if k != "text"} for a in attempts
+        {
+            key: value
+            for key, value in attempt.items()
+            if key != "text"
+        }
+        for attempt in attempts
     ]
 
     return {
         "page_number": page_number,
-        "selected_engine": best_attempt["engine"] if page_status == "success" else None,
+        "selected_engine": (
+            best_attempt["engine"]
+            if page_status == "success"
+            else None
+        ),
         "text": best_attempt.get("text", ""),
-        "average_confidence": best_attempt["average_confidence"],
+        "average_confidence": best_attempt[
+            "average_confidence"
+        ],
         "quality_score": best_attempt["quality_score"],
-        "needs_review": bool(page_status != "success" or best_attempt["quality_score"] < QUALITY_THRESHOLD),
+        "needs_review": bool(
+            page_status != "success"
+            or best_attempt["quality_score"]
+            < QUALITY_THRESHOLD
+        ),
         "engine_attempts": attempt_summaries,
     }
+
+
 
 
 def run_ocr_router(document_id: str, page_paths: List[Path]) -> Dict[str, Any]:

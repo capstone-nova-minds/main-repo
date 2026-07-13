@@ -39,6 +39,26 @@ def _safe_model_dump(obj):
     return obj
 
 
+def _assign_record_indexes(persons: list) -> list:
+    """Stamp each final person/company record with its position in this
+    automatic extraction (0-based). Preserved through the review workflow
+    so evaluation_service.calculate_field_accuracy can associate a
+    human-reviewed row with the correct automatic record even when the
+    reviewer edits its full_name, national_id, or registration_number --
+    never shown in the UI."""
+    indexed = []
+
+    for index, person in enumerate(persons):
+        if hasattr(person, "model_copy"):
+            indexed.append(person.model_copy(update={"record_index": index}))
+        elif hasattr(person, "copy"):
+            indexed.append(person.copy(update={"record_index": index}))
+        else:
+            indexed.append(person)
+
+    return indexed
+
+
 def _save_ocr_output(document_id: str, ocr_result: dict) -> None:
     ensure_data_dirs()
     safe_result = make_json_serializable(ocr_result)
@@ -357,6 +377,7 @@ def process_document(document_id: str):
         document_fields,
         expanded_persons,
     )
+    validated_persons = _assign_record_indexes(validated_persons)
 
     logger.info(
         "document_id=%s final_validated_person_records=%d",

@@ -1,0 +1,21 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+pymupdf
+opencv-python-headless
+easyocr
+pytesseract
+pillow
+numpy
+pandas
+openpyxl
+python-dotenv
+stanza
+
+# Optional: third OCR engine (voting member alongside EasyOCR/Tesseract).
+# The app works fine without it -- if not installed, is_available()
+# returns False and the router just skips it, same as Tesseract when
+# it's missing. Comment out these two lines to skip installing it.
+paddlepaddle
+paddleocr

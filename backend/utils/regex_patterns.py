@@ -109,10 +109,30 @@ PERSON_LINE_KEYWORDS = [
 COMPANY_KEYWORDS = [
     "شركة",
     "مؤسسة",
+    "جمعية",
+    "بنك",
+    "مدارس",
+    "مستشفى",
+    "مكتب",
+    "مركز",
     "سجل تجاري",
     "رقم تسجيل",
     "رقم التسجيل",
     "رقم الشركة",
+]
+
+# Single-word subset of COMPANY_KEYWORDS -- these are the words that can
+# actually lead a company name (the multi-word entries above are label
+# phrases like "رقم التسجيل", never part of the company's own name).
+COMPANY_NAME_KEYWORDS = [
+    "شركة",
+    "مؤسسة",
+    "جمعية",
+    "بنك",
+    "مدارس",
+    "مستشفى",
+    "مكتب",
+    "مركز",
 ]
 
 # Words that show up in property/legal-subject phrases and should never

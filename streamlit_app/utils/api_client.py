@@ -22,6 +22,13 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 DEFAULT_TIMEOUT = 120  # OCR/NER can take a while on CPU
 HEALTH_TIMEOUT = 5  # health checks should fail fast, not hang for 2 minutes
 
+# /process runs the full pipeline (OCR engine attempts across every page,
+# then local NER) on CPU. The very first call after the backend starts
+# also pays a one-time cost to load the EasyOCR and Stanza Arabic models
+# (and, until they fail once, PaddleOCR's) -- comfortably longer than the
+# general-purpose DEFAULT_TIMEOUT above.
+PROCESS_TIMEOUT = int(os.getenv("PROCESS_TIMEOUT", "600"))
+
 
 def check_backend_health() -> Tuple[bool, str]:
     """GET {API_BASE_URL}/healthz. Returns (is_healthy, message)."""
@@ -41,7 +48,7 @@ def upload_document(file):
 
 
 def process_document(document_id: str):
-    response = requests.post(f"{API_BASE_URL}/process/{document_id}", timeout=DEFAULT_TIMEOUT)
+    response = requests.post(f"{API_BASE_URL}/process/{document_id}", timeout=PROCESS_TIMEOUT)
     response.raise_for_status()
     return response.json()
 

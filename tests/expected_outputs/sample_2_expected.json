@@ -1,0 +1,28 @@
+{
+  "document": {
+    "court_name": "محكمة بداية عمان",
+    "case_number": "1208/2026",
+    "document_number": "UW-2026-0008",
+    "document_date": "2026/07/09"
+  },
+  "persons": [
+    {
+      "full_name": "يوسف وليد عادل القضاه",
+      "national_id": "98000000081",
+      "registration_number": null,
+      "person_type": "Individual"
+    },
+    {
+      "full_name": "محمود عادل مصطفى بني يونس",
+      "national_id": "98000000082",
+      "registration_number": null,
+      "person_type": "Individual"
+    },
+    {
+      "full_name": "شركة الافق للخدمات المالية",
+      "national_id": null,
+      "registration_number": "REG-202608",
+      "person_type": "Company"
+    }
+  ]
+}

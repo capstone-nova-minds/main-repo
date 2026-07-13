@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 venv/
 .env.local
+.venv-1/
+.venv-paddle/
 
 data/uploads/*
 data/pages/*
