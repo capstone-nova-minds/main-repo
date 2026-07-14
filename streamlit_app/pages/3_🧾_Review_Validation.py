@@ -69,6 +69,22 @@ render_sidebar_brand()
 render_header("🧾", "Review & Validation", "Check and correct the extracted fields before export. Human review is mandatory.")
 render_stepper(3)
 
+documents = st.session_state.get("documents", [])
+if documents:
+    doc_options = {f"{doc['filename']} ({doc['document_id'][:8]}…)": doc["document_id"] for doc in documents}
+    labels = list(doc_options.keys())
+    default_index = 0
+    for i, doc_id in enumerate(doc_options.values()):
+        if doc_id == st.session_state.get("document_id"):
+            default_index = i
+            break
+    selected_label = st.selectbox("📄 Reviewing document:", labels, index=default_index)
+    selected_id = doc_options[selected_label]
+    if selected_id != st.session_state.get("document_id"):
+        st.session_state["document_id"] = selected_id
+        st.session_state.pop("extraction_result", None)
+    st.write("")
+
 if "document_id" not in st.session_state:
     st.warning("No document uploaded yet. Open **1 Upload** in the sidebar first.")
     st.stop()
@@ -86,9 +102,6 @@ if "extraction_result" not in st.session_state:
 result = st.session_state["extraction_result"]
 
 warnings = []
-ocr_summary = result.get("ocr_summary", {})
-if ocr_summary.get("quality_score", 1.0) < 0.75:
-    warnings.append("جودة قراءة OCR منخفضة (أقل من 0.75) -- يرجى مراجعة جميع الحقول بعناية.")
 
 document_date = (result.get("document", {}).get("document_date") or {}).get("value")
 if not document_date:
@@ -108,38 +121,83 @@ col_doc, col_view = st.columns([2, 1])
 with col_doc:
     with st.container(border=True):
         st.markdown("#### 📋 Document Fields")
-        edited_document = render_document_fields_form(result.get("document", {}))
+        edited_document = render_document_fields_form(result.get("document", {}), document_id)
 
     st.write("")
     with st.container(border=True):
         st.markdown("#### 👥 Persons / Companies")
-        edited_persons = render_persons_table(result.get("persons", []))
+        edited_persons = render_persons_table(result.get("persons", []), document_id)
 
 with col_view:
     with st.container(border=True):
         st.markdown("#### 🖼️ Original Document")
         render_document_viewer(document_id)
 
+# Cache this document's current edits every rerun (not just on Save click)
+# so switching to another document and back doesn't lose them, and so
+# "Save All" below can save every document that's been opened for review
+# in this session -- not just whichever one is on screen right now.
+st.session_state.setdefault("pending_reviews", {})
+st.session_state["pending_reviews"][document_id] = {
+    "document_id": document_id,
+    "document": edited_document,
+    "persons": edited_persons,
+    "ocr_summary": result.get("ocr_summary", {}),
+    "ner_summary": result.get("ner_summary", {}),
+}
+
 st.write("")
 
 with st.container(border=True):
     st.markdown("#### 💾 Save")
     st.caption("Nothing is exported until you save your reviewed result here.")
-    if st.button("💾  Save Reviewed Result", type="primary"):
-        reviewed_payload = {
-            "document_id": document_id,
-            "document": edited_document,
-            "persons": edited_persons,
-            "ocr_summary": result.get("ocr_summary", {}),
-            "ner_summary": result.get("ner_summary", {}),
-        }
-        try:
-            response = save_review(document_id, reviewed_payload)
-            st.session_state["reviewed_result"] = reviewed_payload
-            st.session_state["review_evaluation"] = response.get("evaluation")
-            st.success("Reviewed result saved. Open **4 Export** in the sidebar to download the approved data.")
-        except Exception as exc:
-            st.error(f"Failed to save reviewed result: {exc}")
+
+    col_save_one, col_save_all = st.columns(2)
+
+    with col_save_one:
+        if st.button("💾  Save This Document", type="primary", use_container_width=True):
+            payload = st.session_state["pending_reviews"][document_id]
+            try:
+                response = save_review(document_id, payload)
+                st.session_state["reviewed_result"] = payload
+                st.session_state["review_evaluation"] = response.get("evaluation")
+                st.success("Reviewed result saved. Open **4 Export** in the sidebar to download the approved data.")
+            except Exception as exc:
+                st.error(f"Failed to save reviewed result: {exc}")
+
+    with col_save_all:
+        save_all_disabled = len(documents) <= 1
+        if st.button(
+            "💾  Save All Reviewed Documents",
+            use_container_width=True,
+            disabled=save_all_disabled,
+        ):
+            reviewed_ids = set(st.session_state["pending_reviews"].keys())
+            not_yet_opened = [
+                doc for doc in documents if doc["document_id"] not in reviewed_ids
+            ]
+
+            saved_count = 0
+            errors = []
+            for doc_id, payload in st.session_state["pending_reviews"].items():
+                try:
+                    save_review(doc_id, payload)
+                    saved_count += 1
+                except Exception as exc:
+                    errors.append(f"{doc_id[:8]}…: {exc}")
+
+            if saved_count:
+                st.success(f"Saved {saved_count} reviewed document(s).")
+            if not_yet_opened:
+                names = ", ".join(doc["filename"] for doc in not_yet_opened)
+                st.warning(
+                    f"Skipped (never opened for review yet): {names}. "
+                    "Select each one above at least once before Save All can include it."
+                )
+            if errors:
+                st.error("Some documents failed to save:")
+                for err in errors:
+                    st.write(f"- {err}")
 
 st.write("")
 render_measured_accuracy(st.session_state.get("review_evaluation"))

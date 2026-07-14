@@ -7,7 +7,6 @@ docker-compose.yml). Running locally (no Docker), DATA_DIR defaults to
 """
 
 import os
-import uuid
 from pathlib import Path
 from typing import Tuple
 
@@ -42,7 +41,21 @@ def is_allowed_size(size_bytes: int) -> bool:
 
 
 def generate_document_id() -> str:
-    return str(uuid.uuid4())
+    """Short sequential ID ('1', '2', '3', ...) instead of a UUID, so
+    multiple documents uploaded in one session are easy to tell apart.
+
+    Looks at the highest existing numeric ID already in data/uploads and
+    returns the next one -- this stays safe even with old UUID-named
+    uploads left over from before this change, since those aren't
+    all-digit and get ignored by isdigit().
+    """
+    ensure_data_dirs()
+    existing_ids = [
+        int(f.stem) for f in UPLOADS_DIR.iterdir()
+        if f.is_file() and f.stem.isdigit()
+    ]
+    next_id = max(existing_ids, default=0) + 1
+    return str(next_id)
 
 
 def save_upload(document_id: str, filename: str, content: bytes) -> Path:

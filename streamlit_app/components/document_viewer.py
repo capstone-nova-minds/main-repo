@@ -14,6 +14,25 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent
 PAGES_DIR = DATA_DIR / "pages"
 
 
+@st.dialog("🔍 Original Document", width="large")
+def _show_enlarged(image_path: str, caption: str) -> None:
+    # Streamlit's dialog only offers "small"/"large" presets -- this CSS
+    # override widens it further so the enlarged page is actually bigger,
+    # not just the same size in a modal frame.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] div[role="dialog"] {
+            width: 95vw !important;
+            max-width: 1500px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.image(image_path, caption=caption, use_container_width=True)
+
+
 def render_document_viewer(document_id: str) -> None:
     page_dir = PAGES_DIR / document_id
     if not page_dir.exists():
@@ -27,3 +46,9 @@ def render_document_viewer(document_id: str) -> None:
 
     for page_file in page_files:
         st.image(str(page_file), caption=page_file.stem, use_container_width=True)
+        if st.button(
+            "🔍 Click to enlarge",
+            key=f"zoom_{document_id}_{page_file.stem}",
+            use_container_width=True,
+        ):
+            _show_enlarged(str(page_file), page_file.stem)

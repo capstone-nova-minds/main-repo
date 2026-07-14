@@ -18,7 +18,7 @@ HIDDEN_COLUMNS = ["record_index"]
 ALL_COLUMNS = PERSON_COLUMNS + HIDDEN_COLUMNS
 
 
-def render_persons_table(persons: list) -> list:
+def render_persons_table(persons: list, document_id: str = "") -> list:
     """Render an editable persons table, return the edited list of dicts."""
     if not persons:
         persons = [{
@@ -50,14 +50,16 @@ def render_persons_table(persons: list) -> list:
             "confidence": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05),
             "needs_review": st.column_config.CheckboxColumn(),
         },
-        key="persons_editor",
+        key=f"persons_editor_{document_id}",
     )
 
     # A newly added row (num_rows="dynamic") has no record_index -- pandas
     # fills it (and any other blank cell) with NaN, which isn't valid JSON.
     # Converting to None also makes a missing record_index unambiguous:
     # this row has no corresponding original automatic record.
-    edited_df = edited_df.where(pd.notnull(edited_df), None)
+    # astype(object) first is required: .where(..., None) on a float64
+    # column silently casts None back to NaN otherwise.
+    edited_df = edited_df.astype(object).where(pd.notnull(edited_df), None)
     records = edited_df.to_dict(orient="records")
 
     for record in records:
