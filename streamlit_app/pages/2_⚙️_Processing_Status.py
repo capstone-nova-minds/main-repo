@@ -2,10 +2,13 @@
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 from utils.api_client import process_document
 from utils.styling import (
@@ -15,6 +18,25 @@ from utils.styling import (
     render_stepper,
     status_badge,
 )
+
+
+def _process_all_worker(documents: list, results: dict, status: dict) -> None:
+    """Runs on a background thread so processing keeps going even if the
+    reviewer navigates to a different page -- `results` and `status` are
+    the same dict objects stored in st.session_state, mutated in place, so
+    whichever page reads session_state next sees the latest progress.
+    """
+    try:
+        status["total"] = len(documents)
+        for index, doc in enumerate(documents):
+            status["current_index"] = index + 1
+            status["current_filename"] = doc["filename"]
+            try:
+                results[doc["document_id"]] = process_document(doc["document_id"])
+            except Exception as exc:
+                status["errors"].append(f"{doc['filename']}: {exc}")
+    finally:
+        status["is_running"] = False
 
 st.set_page_config(
     page_title="Processing — Court Order Extraction",
@@ -423,30 +445,54 @@ with st.container(border=True):
     )
 
 if start_clicked:
-    progress = st.progress(0.0)
-    status_area = st.empty()
-    errors = []
+    st.session_state["processing_status"] = {
+        "is_running": True,
+        "current_index": 0,
+        "total": len(documents),
+        "current_filename": "",
+        "errors": [],
+    }
+    thread = threading.Thread(
+        target=_process_all_worker,
+        args=(documents, results, st.session_state["processing_status"]),
+        daemon=True,
+    )
+    add_script_run_ctx(thread)
+    thread.start()
+    st.rerun()
 
-    for index, doc in enumerate(documents):
-        status_area.info(
-            f"Processing {doc['filename']}... ({index + 1}/{len(documents)}) "
+processing_status = st.session_state.get("processing_status")
+
+if processing_status and processing_status.get("is_running"):
+    # The actual work happens on the background thread started above, so
+    # leaving this page doesn't stop processing -- coming back later just
+    # re-enters this same live view. st.status() keeps ONE spinner icon
+    # continuously visible for the whole run (updated in place via
+    # .update()) instead of a spinner that's re-created every rerun --
+    # the repeated create/destroy cycle read as a flicker, not a spin.
+    def _status_label(s: dict) -> str:
+        return (
+            f"Processing {s.get('current_filename', '')}... "
+            f"({s.get('current_index', 0)}/{s.get('total', 0)}) "
             "this can take a while on CPU."
         )
-        try:
-            results[doc["document_id"]] = process_document(doc["document_id"])
-        except Exception as exc:
-            errors.append(f"{doc['filename']}: {exc}")
-        progress.progress((index + 1) / len(documents))
 
-    status_area.empty()
-    progress.empty()
-
+    with st.status(_status_label(processing_status), state="running", expanded=True) as status_box:
+        while st.session_state["processing_status"]["is_running"]:
+            status_box.update(label=_status_label(st.session_state["processing_status"]))
+            time.sleep(0.5)
+        status_box.update(label="Processing complete.", state="complete")
+    st.rerun()
+elif processing_status and not processing_status.get("is_running") and processing_status.get("total"):
+    errors = processing_status.get("errors") or []
     if errors:
         st.error("Some documents failed to process:")
         for err in errors:
             st.write(f"- {err}")
     else:
-        st.success(f"Processed {len(documents)} document(s).")
+        st.success(f"Processed {processing_status['total']} document(s).")
+    # Consume the status once shown so it doesn't repeat on every future rerun.
+    processing_status["total"] = 0
 
 if results:
     st.write("")
