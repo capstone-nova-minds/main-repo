@@ -239,8 +239,6 @@ def render_sidebar_brand() -> None:
         f'<div class="sidebar-logo">{render_logo(150, 44)}</div>',
         unsafe_allow_html=True,
     )
-    st.sidebar.caption("Court Order Extraction · Local OCR + Rule-based Extraction + Arabic NER")
-    st.sidebar.info("No LLM · No Cloud AI · No External API")
 
 
 def render_header(icon: str, title: str, subtitle: str) -> None:

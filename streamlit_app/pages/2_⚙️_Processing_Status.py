@@ -30,20 +30,6 @@ DATA_DIR = Path(
 )
 OCR_OUTPUTS_DIR = DATA_DIR / "ocr_outputs"
 
-OCR_QUALITY_WARNING_THRESHOLD = 0.70
-
-def get_ocr_quality_status(score: float) -> tuple[str, str]:
-    """
-    Convert OCR quality score into a stakeholder-friendly status.
-    """
-    if score >= 0.80:
-        return "High OCR Quality", "success"
-
-    if score >= 0.65:
-        return "Medium OCR Quality", "warning"
-
-    return "Low OCR Quality", "error"
-
 # ---------------------------------------------------------------------------
 # Stakeholder-friendly scoring helpers
 # ---------------------------------------------------------------------------
@@ -321,27 +307,11 @@ def render_technical_details(result: dict, document_id: str):
             f"{ocr_summary.get('average_confidence', 0.0):.2f}",
         )
 
-        col4, col5 = st.columns(2)
-        col4.metric(
+        st.metric(
             "OCR Quality Score",
             f"{ocr_summary.get('quality_score', 0.0):.2f}",
         )
 
-        ocr_quality_score = float(ocr_summary.get("quality_score", 0.0) or 0.0)
-        quality_label, quality_tone = get_ocr_quality_status(ocr_quality_score)
-
-        with col5:
-            st.markdown(
-                status_badge(quality_label, quality_tone),
-                unsafe_allow_html=True,
-            )
-
-        if ocr_quality_score < 0.65:
-            st.warning("جودة قراءة النص منخفضة، يرجى مراجعة البيانات بعناية.")
-        elif ocr_quality_score < 0.80:
-            st.info("جودة قراءة النص متوسطة، لكن الحقول المستخرجة ما زالت قابلة للمراجعة والتحقق.")
-
-            
         with st.expander("📄 View OCR Text", expanded=False):
 
             ocr_output_path = OCR_OUTPUTS_DIR / f"{document_id}.json"
@@ -421,48 +391,116 @@ render_sidebar_brand()
 render_header(
     "⚙️",
     "Processing Status",
-    "Run OCR, local Arabic NER, and rule-based extraction on the uploaded document.",
+    "Run OCR, local Arabic NER, and rule-based extraction on the uploaded document(s).",
 )
 render_stepper(2)
 
-if "document_id" not in st.session_state:
-    st.warning("No document uploaded yet. Open **1 Upload** in the sidebar first.")
-    st.stop()
+documents = st.session_state.get("documents")
+if not documents:
+    # Backward compatibility with a single document uploaded in an older session shape.
+    if "document_id" in st.session_state:
+        documents = [{
+            "document_id": st.session_state["document_id"],
+            "filename": st.session_state.get("filename", "unknown"),
+        }]
+    else:
+        st.warning("No document uploaded yet. Open **1 Upload** in the sidebar first.")
+        st.stop()
 
-document_id = st.session_state["document_id"]
+st.session_state.setdefault("extraction_results", {})
+results = st.session_state["extraction_results"]
 
 with st.container(border=True):
-    col_id, col_btn = st.columns([3, 1])
-    col_id.markdown(f"**Document:** `{document_id}`")
-    start_clicked = col_btn.button(
-        "▶️  Start Processing",
+    st.markdown(f"**{len(documents)} document(s) ready to process:**")
+    for doc in documents:
+        mark = "✅" if doc["document_id"] in results else "⏳"
+        st.write(f"{mark} {doc['filename']} — `{doc['document_id']}`")
+
+    start_clicked = st.button(
+        f"▶️  Process All ({len(documents)})",
         type="primary",
         use_container_width=True,
     )
 
 if start_clicked:
-    with st.spinner("Running OCR, NER, and rule-based extraction... this can take a while on CPU."):
+    progress = st.progress(0.0)
+    status_area = st.empty()
+    errors = []
+
+    for index, doc in enumerate(documents):
+        status_area.info(
+            f"Processing {doc['filename']}... ({index + 1}/{len(documents)}) "
+            "this can take a while on CPU."
+        )
         try:
-            result = process_document(document_id)
-            st.session_state["extraction_result"] = result
-            st.success("Processing complete.")
+            results[doc["document_id"]] = process_document(doc["document_id"])
         except Exception as exc:
-            st.error(f"Processing failed: {exc}")
-            st.stop()
+            errors.append(f"{doc['filename']}: {exc}")
+        progress.progress((index + 1) / len(documents))
 
-if "extraction_result" in st.session_state:
-    result = st.session_state["extraction_result"]
+    status_area.empty()
+    progress.empty()
+
+    if errors:
+        st.error("Some documents failed to process:")
+        for err in errors:
+            st.write(f"- {err}")
+    else:
+        st.success(f"Processed {len(documents)} document(s).")
+
+if results:
+    st.write("")
+    st.subheader("📊 Summary — all processed documents")
+
+    summary_rows = []
+    for doc in documents:
+        result = results.get(doc["document_id"])
+        if result is None:
+            summary_rows.append({
+                "Filename": doc["filename"],
+                "Document ID": doc["document_id"][:8] + "…",
+                "Status": "Not processed yet",
+                "Quality Score": None,
+                "Persons Found": None,
+            })
+            continue
+        score_data = calculate_extraction_score(result)
+        summary_rows.append({
+            "Filename": doc["filename"],
+            "Document ID": doc["document_id"][:8] + "…",
+            "Status": "Processed",
+            "Quality Score": f"{score_data['score']}%",
+            "Persons Found": score_data["persons_found"],
+        })
+
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # Default the "active" document (used by Review & Export) to the first
+    # one, but each page also has its own selector so this is just a sane
+    # starting point, not something the reviewer needs to manage here.
+    st.session_state.setdefault("document_id", documents[0]["document_id"])
+    st.session_state.setdefault("filename", documents[0]["filename"])
 
     st.write("")
+    st.subheader("🔍 Details — click a tab to see everything for that document")
 
-    # Main stakeholder view
-    render_extraction_score(result)
-    render_clean_results(result)
+    tab_labels = [f"{doc['filename']}" for doc in documents]
+    tabs = st.tabs(tab_labels)
 
-    st.write("")
-    st.info("➡️ Next step: open **3 Review & Validation** in the sidebar to review and correct the extracted data.")
+    for tab, doc in zip(tabs, documents):
+        with tab:
+            doc_id = doc["document_id"]
+            result = results.get(doc_id)
 
-    st.write("")
+            if result is None:
+                st.info("This document hasn't been processed yet. Click **Process All** above.")
+                continue
 
-    # Hidden technical/debug details
-    render_technical_details(result, document_id)
+            render_extraction_score(result)
+            render_clean_results(result)
+
+            st.write("")
+            st.info("➡️ Next step: open **3 Review & Validation** in the sidebar to review and correct the extracted data.")
+
+            st.write("")
+            render_technical_details(result, doc_id)

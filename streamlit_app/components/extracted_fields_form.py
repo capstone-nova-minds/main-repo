@@ -11,8 +11,14 @@ FIELD_LABELS = {
 }
 
 
-def render_document_fields_form(document: dict) -> dict:
-    """Render editable inputs for each document field, return the edited dict."""
+def render_document_fields_form(document: dict, document_id: str = "") -> dict:
+    """Render editable inputs for each document field, return the edited dict.
+
+    document_id is mixed into each widget's key so Streamlit treats the
+    fields as brand-new widgets when the reviewer switches documents --
+    otherwise it keeps showing the previously selected document's cached
+    values instead of the new one's.
+    """
     edited = {}
 
     for field_name in DOCUMENT_FIELDS:
@@ -24,7 +30,7 @@ def render_document_fields_form(document: dict) -> dict:
         if needs_review:
             label += " ⚠️ needs review"
 
-        new_value = st.text_input(label, value=current_value, key=f"doc_field_{field_name}")
+        new_value = st.text_input(label, value=current_value, key=f"doc_field_{document_id}_{field_name}")
 
         edited[field_name] = {
             "value": new_value if new_value else None,

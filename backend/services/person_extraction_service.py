@@ -639,7 +639,8 @@ def _clean_structured_company_name(raw_name: str) -> Optional[str]:
 def _extract_name_near_national_id(
     section_text: str,
     national_id: str,
-) -> Optional[str]:
+    search_from: int = 0,
+) -> "tuple[Optional[str], int]":
     """
     Extract individual name around National ID from flattened target section.
 
@@ -647,14 +648,21 @@ def _extract_name_near_national_id(
     - name before ID
     - name after ID
     - fields split into different lines
+
+    Returns (name, id_pos). id_pos is -1 if this national_id doesn't occur
+    at or after search_from. Callers use id_pos to keep searching past this
+    occurrence -- the same ID text can appear more than once (e.g. an OCR
+    misread duplicating a digit between two different people), and each
+    occurrence should get its own chance at a name instead of every
+    occurrence but the first being silently skipped.
     """
     if not section_text or not national_id:
-        return None
+        return None, -1
 
-    id_pos = section_text.find(national_id)
+    id_pos = section_text.find(national_id, search_from)
 
     if id_pos == -1:
-        return None
+        return None, -1
 
     before_id = section_text[max(0, id_pos - 220):id_pos]
     after_id = section_text[id_pos + len(national_id): id_pos + len(national_id) + 180]
@@ -663,14 +671,14 @@ def _extract_name_near_national_id(
     before_name = _clean_structured_person_name(before_id)
 
     if before_name:
-        return before_name
+        return before_name, id_pos
 
     after_name = _clean_structured_person_name(after_id)
 
     if after_name:
-        return after_name
+        return after_name, id_pos
 
-    return None
+    return None, id_pos
 
 
 def _find_registration_numbers(text: str) -> List[str]:
@@ -763,15 +771,26 @@ def _extract_structured_list_records(cleaned_text: str) -> List[PersonRecord]:
 
     # ------------------------------------------------------------
     # Individuals: National ID-based extraction.
+    #
+    # Deliberately does NOT dedupe the ID list before extracting names:
+    # the same ID text can legitimately appear more than once (e.g. an
+    # OCR misread duplicating a digit between two different siblings), and
+    # collapsing to unique IDs first meant every occurrence past the first
+    # was silently skipped, dropping a real person from the result.
+    # Instead we walk every occurrence by position; _deduplicate_records
+    # below still merges true duplicates (same ID *and* same name).
     # ------------------------------------------------------------
-    national_ids = []
+    search_from = 0
 
     for national_id in find_national_ids(section_text):
-        if national_id not in national_ids:
-            national_ids.append(national_id)
+        full_name, id_pos = _extract_name_near_national_id(
+            section_text, national_id, search_from=search_from
+        )
 
-    for national_id in national_ids:
-        full_name = _extract_name_near_national_id(section_text, national_id)
+        if id_pos == -1:
+            continue
+
+        search_from = id_pos + len(national_id)
 
         if not full_name:
             continue
@@ -847,21 +866,19 @@ def _extract_direct_legal_phrase_records(cleaned_text: str) -> List[PersonRecord
 
     search_text = re.sub(r"\s+", " ", cleaned_text)
     records: List[PersonRecord] = []
-    seen_ids = set()
 
+    # No same-ID skip here: two different people can legitimately share an
+    # (possibly OCR-misread) ID, and the caller's final _deduplicate_records
+    # pass already handles same-ID collisions correctly -- keeping both and
+    # flagging for review when the names differ, merging true duplicates
+    # when they match.
     for pattern in _DIRECT_PHRASE_PATTERNS:
         for match in pattern.finditer(search_text):
             national_id = match.group("id")
-
-            if national_id in seen_ids:
-                continue
-
             name = _clean_direct_match_name(match.group("name"))
 
             if not name:
                 continue
-
-            seen_ids.add(national_id)
 
             records.append(
                 _make_person_record(
@@ -1378,11 +1395,28 @@ def _deduplicate_records(records: List[PersonRecord]) -> List[PersonRecord]:
             key = None
 
         if key:
-            if key not in best_by_key:
+            existing = best_by_key.get(key)
+
+            if existing is None:
                 best_by_key[key] = record
                 continue
 
-            if _record_score(record) > _record_score(best_by_key[key]):
+            if (
+                existing.full_name
+                and record.full_name
+                and existing.full_name != record.full_name
+            ):
+                # Same ID, different names: likely two different people who
+                # happen to share an (possibly OCR-misread) ID, not one
+                # person detected twice. Keep both instead of silently
+                # dropping one, and flag both since the ID collision itself
+                # is worth a human double-checking.
+                existing.needs_review = True
+                record.needs_review = True
+                no_key_records.append(record)
+                continue
+
+            if _record_score(record) > _record_score(existing):
                 best_by_key[key] = record
         else:
             no_key_records.append(record)
