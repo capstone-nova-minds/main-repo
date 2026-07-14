@@ -466,16 +466,22 @@ processing_status = st.session_state.get("processing_status")
 if processing_status and processing_status.get("is_running"):
     # The actual work happens on the background thread started above, so
     # leaving this page doesn't stop processing -- coming back later just
-    # re-enters this same live view. Rerunning every ~1s (instead of one
-    # long spinner call) keeps the filename/count text up to date too,
-    # not just the spinning animation.
-    st.info(
-        f"⏳ Processing {processing_status.get('current_filename', '')}... "
-        f"({processing_status.get('current_index', 0)}/{processing_status.get('total', 0)}) "
-        "this can take a while on CPU."
-    )
-    with st.spinner("Working..."):
-        time.sleep(1)
+    # re-enters this same live view. st.status() keeps ONE spinner icon
+    # continuously visible for the whole run (updated in place via
+    # .update()) instead of a spinner that's re-created every rerun --
+    # the repeated create/destroy cycle read as a flicker, not a spin.
+    def _status_label(s: dict) -> str:
+        return (
+            f"Processing {s.get('current_filename', '')}... "
+            f"({s.get('current_index', 0)}/{s.get('total', 0)}) "
+            "this can take a while on CPU."
+        )
+
+    with st.status(_status_label(processing_status), state="running", expanded=True) as status_box:
+        while st.session_state["processing_status"]["is_running"]:
+            status_box.update(label=_status_label(st.session_state["processing_status"]))
+            time.sleep(0.5)
+        status_box.update(label="Processing complete.", state="complete")
     st.rerun()
 elif processing_status and not processing_status.get("is_running") and processing_status.get("total"):
     errors = processing_status.get("errors") or []
