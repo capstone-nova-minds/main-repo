@@ -16,3 +16,8 @@ class PersonRecord(BaseModel):
     needs_review: bool = True
     source: str = "rules"  # "rules", "ner", or "rules+ner"
     extraction_method: Optional[str] = None
+    # Stamped by api/process.py with this record's position in the final
+    # validated list -- lets Measured Field Accuracy match a reviewed
+    # person back to the correct automatic record even after the reviewer
+    # edits its name/ID (see evaluation_service.calculate_field_accuracy).
+    record_index: Optional[int] = None

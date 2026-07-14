@@ -358,6 +358,13 @@ def process_document(document_id: str):
         expanded_persons,
     )
 
+    # Stamp each person with its position so Measured Field Accuracy can
+    # match a reviewed record back to its original automatic record even
+    # after the reviewer edits the name/ID (see
+    # evaluation_service.calculate_field_accuracy).
+    for index, person in enumerate(validated_persons):
+        person.record_index = index
+
     logger.info(
         "document_id=%s final_validated_person_records=%d",
         document_id,
